@@ -235,12 +235,31 @@ static int check_thread_rseq(pid_t tid, const struct parasite_check_rseq *ti_rse
 
 struct cr_imgset *glob_imgset;
 
-static int collect_fds(pid_t pid, struct parasite_drain_fd **dfds)
+static int grow_dfds(struct parasite_drain_fd **dfds, int *size, int n)
+{
+	if (sizeof(struct parasite_drain_fd) + sizeof(int) * (n + 1) > (size_t)*size) {
+		struct parasite_drain_fd *t;
+
+		*size += PAGE_SIZE;
+		t = xrealloc(*dfds, *size);
+		if (!t)
+			return -1;
+		*dfds = t;
+	}
+	return 0;
+}
+
+/*
+ * io_uring fds cannot be passed to the dumper via SCM_RIGHTS (the kernel rejects
+ * it with EINVAL), so they are collected separately and grabbed with pidfd_getfd
+ * in dump_task_files_seized() instead of the normal parasite SCM drain.
+ */
+static int collect_fds(pid_t pid, struct parasite_drain_fd **dfds, struct parasite_drain_fd **iour_dfds)
 {
 	struct dirent *de;
 	DIR *fd_dir;
-	int size = 0;
-	int n;
+	int size = 0, isize = 0;
+	int n = 0, in = 0;
 
 	pr_info("\n");
 	pr_info("Collecting fds (pid: %d)\n", pid);
@@ -250,28 +269,41 @@ static int collect_fds(pid_t pid, struct parasite_drain_fd **dfds)
 	if (!fd_dir)
 		return -1;
 
-	n = 0;
 	while ((de = readdir(fd_dir))) {
+		char link[64];
+		ssize_t ll;
+		bool is_iour = false;
+		int fd;
+
 		if (dir_dots(de))
 			continue;
 
-		if (sizeof(struct parasite_drain_fd) + sizeof(int) * (n + 1) > size) {
-			struct parasite_drain_fd *t;
+		fd = atoi(de->d_name);
 
-			size += PAGE_SIZE;
-			t = xrealloc(*dfds, size);
-			if (!t) {
+		ll = readlinkat(dirfd(fd_dir), de->d_name, link, sizeof(link) - 1);
+		if (ll > 0) {
+			link[ll] = '\0';
+			is_iour = strstr(link, "[io_uring]") != NULL;
+		}
+
+		if (is_iour) {
+			if (grow_dfds(iour_dfds, &isize, in)) {
 				closedir(fd_dir);
 				return -1;
 			}
-			*dfds = t;
+			(*iour_dfds)->fds[in++] = fd;
+		} else {
+			if (grow_dfds(dfds, &size, n)) {
+				closedir(fd_dir);
+				return -1;
+			}
+			(*dfds)->fds[n++] = fd;
 		}
-
-		(*dfds)->fds[n++] = atoi(de->d_name);
 	}
 
 	(*dfds)->nr_fds = n;
-	pr_info("Found %d file descriptors\n", n);
+	(*iour_dfds)->nr_fds = in;
+	pr_info("Found %d file descriptors (%d io_uring)\n", n + in, in);
 	pr_info("----------------------------------------\n");
 
 	closedir(fd_dir);
@@ -1566,6 +1598,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct parasite_dump_misc misc;
 	struct cr_imgset *cr_imgset = NULL;
 	struct parasite_drain_fd *dfds = NULL;
+	struct parasite_drain_fd *iour_dfds = NULL;
 	struct proc_posix_timers_stat proc_args;
 	struct mem_dump_ctl mdc;
 
@@ -1594,10 +1627,11 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 
 	if (!shared_fdtable(item)) {
 		dfds = xmalloc(sizeof(*dfds));
-		if (!dfds)
+		iour_dfds = xmalloc(sizeof(*iour_dfds));
+		if (!dfds || !iour_dfds)
 			goto err;
 
-		ret = collect_fds(pid, &dfds);
+		ret = collect_fds(pid, &dfds, &iour_dfds);
 		if (ret) {
 			pr_err("Collect fds (pid: %d) failed with %d\n", pid, ret);
 			goto err;
@@ -1698,7 +1732,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	if (dfds) {
-		ret = dump_task_files_seized(parasite_ctl, item, dfds);
+		ret = dump_task_files_seized(parasite_ctl, item, dfds, iour_dfds);
 		if (ret) {
 			pr_err("Dump files (pid: %d) failed with %d\n", pid, ret);
 			goto err_cure;
@@ -1792,6 +1826,7 @@ err:
 	close_pid_proc();
 	free_mappings(&vmas);
 	xfree(dfds);
+	xfree(iour_dfds);
 	return exit_code;
 
 err_cure:

@@ -140,7 +140,8 @@ struct cr_img;
 extern int dump_my_file(int lfd, u32 *, int *type);
 extern int do_dump_gen_file(struct fd_parms *p, int lfd, const struct fdtype_ops *ops, FdinfoEntry *e);
 struct parasite_drain_fd;
-int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, struct parasite_drain_fd *dfds);
+int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, struct parasite_drain_fd *dfds,
+			   struct parasite_drain_fd *iour_dfds);
 int predump_task_files(int pid);
 
 extern void file_desc_init(struct file_desc *d, u32 id, struct file_desc_ops *ops);
