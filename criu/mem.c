@@ -113,6 +113,8 @@ static bool should_dump_entire_vma(VmaEntry *vmae)
 		return true;
 	if (vma_entry_is(vmae, VMA_AREA_AIORING))
 		return true;
+	if (vma_entry_is(vmae, VMA_AREA_IO_URING))
+		return true;
 
 	return false;
 }
@@ -306,7 +308,8 @@ prep_dump_pages_args(struct parasite_ctl *ctl, struct vm_area_list *vma_area_lis
 		 * Kernel write to aio ring is not soft-dirty tracked,
 		 * so we ignore them at pre-dump.
 		 */
-		if (vma_entry_is(vma->e, VMA_AREA_AIORING) && skip_non_trackable)
+		if ((vma_entry_is(vma->e, VMA_AREA_AIORING) || vma_entry_is(vma->e, VMA_AREA_IO_URING)) &&
+		    skip_non_trackable)
 			continue;
 		/*
 		 * We totally ignore MAP_HUGETLB on pre-dump.
@@ -496,7 +499,8 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 	 * parent images from pre-dump stages. Instead, the content is restored from
 	 * the parasite context using full memory image.
 	 */
-	if (vma_entry_is(vma->e, VMA_AREA_AIORING) || vma->e->flags & MAP_HUGETLB) {
+	if (vma_entry_is(vma->e, VMA_AREA_AIORING) || vma_entry_is(vma->e, VMA_AREA_IO_URING) ||
+	    vma->e->flags & MAP_HUGETLB) {
 		if (pre_dump)
 			return 0;
 		has_parent = false;

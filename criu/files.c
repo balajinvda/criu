@@ -1,6 +1,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/syscall.h>
 
 #include <linux/limits.h>
 #include <linux/major.h>
@@ -50,6 +51,7 @@
 #include "fdstore.h"
 #include "bpfmap.h"
 #include "pidfd.h"
+#include "io_uring.h"
 
 #include "protobuf.h"
 #include "util.h"
@@ -547,6 +549,8 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 			ops = &timerfd_dump_ops;
 		else if (is_pidfd_link(link))
 			ops = &pidfd_dump_ops;
+		else if (is_io_uring_link(link))
+			ops = &io_uring_dump_ops;
 #ifdef CONFIG_HAS_LIBBPF
 		else if (is_bpfmap_link(link))
 			ops = &bpfmap_dump_ops;
@@ -618,7 +622,101 @@ int dump_my_file(int lfd, u32 *id, int *type)
 	return 0;
 }
 
-int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, struct parasite_drain_fd *dfds)
+/* Dumper-side equivalent of the parasite's fill_fds_opts() for a single lfd. */
+static int dump_fill_fd_opts(int lfd, struct fd_opts *p)
+{
+	int flags;
+	struct f_owner_ex owner_ex;
+	uint32_t v[2];
+
+	memset(p, 0, sizeof(*p));
+
+	flags = fcntl(lfd, F_GETFD, 0);
+	if (flags < 0) {
+		pr_perror("fcntl(F_GETFD) on grabbed fd");
+		return -1;
+	}
+	p->flags = (char)flags;
+
+	flags = fcntl(lfd, F_GETFL, 0);
+	if (flags < 0) {
+		pr_perror("fcntl(F_GETFL) on grabbed fd");
+		return -1;
+	}
+	if (flags & O_PATH)
+		return 0;
+
+	if (fcntl(lfd, F_GETOWN_EX, &owner_ex)) {
+		pr_perror("fcntl(F_GETOWN_EX) on grabbed fd");
+		return -1;
+	}
+	if (owner_ex.pid == 0)
+		return 0;
+
+	if (fcntl(lfd, F_GETOWNER_UIDS, &v)) {
+		pr_perror("fcntl(F_GETOWNER_UIDS) on grabbed fd");
+		return -1;
+	}
+	p->fown.uid = v[0];
+	p->fown.euid = v[1];
+	p->fown.pid_type = owner_ex.type;
+	p->fown.pid = owner_ex.pid;
+	return 0;
+}
+
+/*
+ * io_uring fds cannot be passed to the dumper via SCM_RIGHTS (the kernel rejects
+ * it with EINVAL). Grab each one with pidfd_getfd() and dump it through the normal
+ * lfd path instead.
+ */
+static int dump_iour_fds(struct pstree_item *item, struct parasite_drain_fd *iour_dfds, struct parasite_ctl *ctl,
+			 struct parasite_drain_fd *dfds, struct cr_img *img)
+{
+	int i, pidfd, ret = 0;
+
+	if (!iour_dfds || !iour_dfds->nr_fds)
+		return 0;
+
+	if (!kdat.has_pidfd_getfd) {
+		pr_err("Can't dump io_uring fd without pidfd_getfd support\n");
+		return -1;
+	}
+
+	pidfd = syscall(SYS_pidfd_open, item->pid->real, 0);
+	if (pidfd < 0) {
+		pr_perror("Can't pidfd_open %d for io_uring fds", item->pid->real);
+		return -1;
+	}
+
+	for (i = 0; i < iour_dfds->nr_fds; i++) {
+		FdinfoEntry e = FDINFO_ENTRY__INIT;
+		struct fd_opts opt;
+		int fd = iour_dfds->fds[i];
+		int lfd = syscall(SYS_pidfd_getfd, pidfd, fd, 0);
+
+		if (lfd < 0) {
+			pr_perror("pidfd_getfd(%d) for io_uring fd failed", fd);
+			ret = -1;
+			break;
+		}
+
+		ret = dump_fill_fd_opts(lfd, &opt);
+		if (!ret)
+			ret = dump_one_file(item->pid, fd, lfd, &opt, ctl, &e, dfds);
+		if (!ret)
+			ret = pb_write_one(img, &e, PB_FDINFO);
+
+		close(lfd);
+		if (ret)
+			break;
+	}
+
+	close(pidfd);
+	return ret;
+}
+
+int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, struct parasite_drain_fd *dfds,
+			   struct parasite_drain_fd *iour_dfds)
 {
 	int *lfds = NULL;
 	struct cr_img *img = NULL;
@@ -666,6 +764,9 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 		for (i = 0; i < nr_fds; i++)
 			close(lfds[i]);
 	}
+
+	if (!ret)
+		ret = dump_iour_fds(item, iour_dfds, ctl, dfds, img);
 
 	pr_info("----------------------------------------\n");
 err:

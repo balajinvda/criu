@@ -83,6 +83,9 @@ static bool uprobes_vma_exists = false;
 
 #define AIO_FNAME "/[aio]"
 
+/* io_uring SQ/CQ ring + SQEs mappings appear as "anon_inode:[io_uring]" in proc */
+#define IO_URING_FNAME "[io_uring]"
+
 /* check the @line starts with "%lx-%lx" format */
 static bool __is_vma_range_fmt(char *line)
 {
@@ -505,6 +508,13 @@ static int vma_get_mapfile(const char *fname, struct vma_area *vma, DIR *mfd, st
 				/* AIO ring, let's try */
 				close_safe(vm_file_fd);
 				vma->e->status = VMA_AREA_AIORING;
+				return 0;
+			}
+
+			if ((buf.st_mode & S_IFMT) == 0 && strstr(fname, IO_URING_FNAME)) {
+				/* io_uring SQ/CQ ring or SQEs mapping (recreated on restore) */
+				close_safe(vm_file_fd);
+				vma->e->status = VMA_AREA_IO_URING;
 				return 0;
 			}
 
@@ -2041,6 +2051,56 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 				goto parse_err;
 
 			entry_met = true;
+			continue;
+		}
+		if (fdinfo_field(str, "SqMask")) {
+			IoUringFileEntry *iour = arg;
+			uint64_t mask;
+
+			if (type != FD_TYPES__IO_URING)
+				goto parse_err;
+			if (sscanf(str, "SqMask: 0x%" SCNx64, &mask) != 1)
+				goto parse_err;
+			iour->sq_entries = (uint32_t)(mask + 1);
+
+			entry_met = true;
+			continue;
+		}
+		if (fdinfo_field(str, "CqMask")) {
+			IoUringFileEntry *iour = arg;
+			uint64_t mask;
+
+			if (type != FD_TYPES__IO_URING)
+				goto parse_err;
+			if (sscanf(str, "CqMask: 0x%" SCNx64, &mask) != 1)
+				goto parse_err;
+			iour->cq_entries = (uint32_t)(mask + 1);
+			continue;
+		}
+		if (fdinfo_field(str, "UserFiles") || fdinfo_field(str, "UserBufs")) {
+			unsigned int n;
+
+			if (type != FD_TYPES__IO_URING)
+				goto parse_err;
+			if (sscanf(str, "%*[^:]: %u", &n) != 1)
+				goto parse_err;
+			if (n != 0) {
+				pr_err("io_uring with registered files/buffers not supported\n");
+				goto parse_err;
+			}
+			continue;
+		}
+		if (fdinfo_field(str, "SqThread")) {
+			int t;
+
+			if (type != FD_TYPES__IO_URING)
+				goto parse_err;
+			if (sscanf(str, "SqThread: %d", &t) != 1)
+				goto parse_err;
+			if (t != -1) {
+				pr_err("io_uring with SQPOLL thread not supported\n");
+				goto parse_err;
+			}
 			continue;
 		}
 		if (fdinfo_field(str, "tfd")) {
