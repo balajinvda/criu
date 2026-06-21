@@ -82,6 +82,7 @@
 #include "bpfmap.h"
 #include "apparmor.h"
 #include "pidfd.h"
+#include "io_uring.h"
 
 #include "parasite-syscall.h"
 #include "files-reg.h"
@@ -692,6 +693,9 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	 * timer setting at the very late.
 	 */
 	if (prepare_timerfds(ta))
+		return -1;
+
+	if (prepare_io_urings(ta))
 		return -1;
 
 	if (seccomp_prepare_threads(current, ta) < 0)

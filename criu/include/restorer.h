@@ -187,6 +187,9 @@ struct task_restore_args {
 	struct rst_aio_ring *rings;
 	unsigned int rings_n;
 
+	/* Restored io_uring ring fd; VMA_AREA_IO_URING mappings are re-mmap'd from it. */
+	int io_uring_fd;
+
 	struct rlimit64 *rlims;
 	unsigned int rlims_n;
 
