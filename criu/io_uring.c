@@ -34,8 +34,7 @@ static int dump_one_io_uring(int lfd, u32 id, const struct fd_parms *p)
 	iour.id = id;
 	iour.flags = p->flags;
 	iour.fown = (FownEntry *)&p->fown;
-	/* Default-setup ring (no SQPOLL/CQSIZE); guaranteed quiesced at dump time. */
-	iour.setup_flags = 0;
+	/* setup_flags filled by parse_fdinfo (e.g. IORING_SETUP_SQPOLL); ring is quiesced at dump. */
 
 	pr_info("Dumping id %#x sq_entries %u cq_entries %u flags %#x\n", iour.id, iour.sq_entries, iour.cq_entries,
 		iour.flags);
