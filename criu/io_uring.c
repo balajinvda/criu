@@ -34,6 +34,7 @@ static int dump_one_io_uring(int lfd, u32 id, const struct fd_parms *p)
 	iour.id = id;
 	iour.flags = p->flags;
 	iour.fown = (FownEntry *)&p->fown;
+	iour.ino = p->stat.st_ino; /* matches the ring VMAs' shmid, for per-ring restore mapping */
 	/* setup_flags filled by parse_fdinfo (e.g. IORING_SETUP_SQPOLL); ring is quiesced at dump. */
 
 	pr_info("Dumping id %#x sq_entries %u cq_entries %u flags %#x\n", iour.id, iour.sq_entries, iour.cq_entries,
@@ -117,24 +118,25 @@ struct collect_image_info io_uring_cinfo = {
 };
 
 /*
- * The io_uring SQ/CQ ring and SQEs mappings (VMA_AREA_IO_URING) are re-mmap'd
- * from the restored ring fd in the PIE restorer (see __export_restore_task).
- * Pass that fd down via task_restore_args. Only one ring per task is supported.
+ * The io_uring SQ/CQ ring and SQEs mappings (VMA_AREA_IO_URING) are re-mmap'd in
+ * the PIE restorer (see __export_restore_task) from the ring whose inode matches
+ * the vma's shmid. Pass the (inode, fd) of every restored ring via task_restore_args.
  */
 int prepare_io_urings(struct task_restore_args *ta)
 {
 	struct io_uring_info *info;
-	int n = 0;
 
-	ta->io_uring_fd = -1;
+	ta->iour_rings = (struct rst_iour *)rst_mem_align_cpos(RM_PRIVATE);
+	ta->iour_rings_n = 0;
+
 	list_for_each_entry(info, &rst_io_urings, rlist) {
-		ta->io_uring_fd = info->uring_fd;
-		n++;
-	}
+		struct rst_iour *r = rst_mem_alloc(sizeof(*r), RM_PRIVATE);
 
-	if (n > 1) {
-		pr_err("Multiple io_uring rings per task not supported (%d)\n", n);
-		return -1;
+		if (!r)
+			return -1;
+		r->ino = info->ioure->ino;
+		r->fd = info->uring_fd;
+		ta->iour_rings_n++;
 	}
 
 	return 0;

@@ -13,4 +13,5 @@ message io_uring_file_entry {
 	required uint32		setup_flags	= 4 [(criu).hex = true];
 	required uint32		sq_entries	= 5;
 	required uint32		cq_entries	= 6;
+	required uint64		ino		= 7;
 }
