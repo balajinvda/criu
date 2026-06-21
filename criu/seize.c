@@ -900,9 +900,22 @@ static int collect_threads(struct pstree_item *item)
 	for (i = 0; i < nr_threads; i++) {
 		pid_t pid = threads[i].real;
 		struct proc_status_creds t_creds = {};
+		struct proc_pid_stat t_stat;
 
 		if (thread_collected(item, pid))
 			continue;
+
+		/*
+		 * io_uring worker threads (iou-sqp-*, iou-wrk-*) are kernel-managed
+		 * threads. They can't be ptrace-dumped (CRIU hangs waiting for a stop
+		 * that never comes) and are recreated by io_uring_setup() / io-wq on
+		 * restore, so skip seizing/dumping them. PF_IO_WORKER is not exposed in
+		 * /proc/<tid>/stat flags, so detect by the kernel's comm naming.
+		 */
+		if (parse_pid_stat(pid, &t_stat) == 0 && !strncmp(t_stat.comm, "iou-", 4)) {
+			pr_info("\tSkipping io_uring worker thread %d (%s) of %d\n", pid, t_stat.comm, item->pid->real);
+			continue;
+		}
 
 		nr_inprogress++;
 

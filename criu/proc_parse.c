@@ -448,9 +448,21 @@ static int vma_get_mapfile(const char *fname, struct vma_area *vma, DIR *mfd, st
 		/*
 		 * If vfi is equal (!) and negative @vm_file_fd --
 		 * we have nothing to borrow for sure.
+		 *
+		 * Exception: AIO/io_uring rings are special anon_inode
+		 * mappings with no openable map_files link (fd closed during
+		 * detection). An io_uring instance maps the same inode twice
+		 * (SQ/CQ ring + SQEs); when those vmas are adjacent the second
+		 * one lands here, so inherit the first one's classification
+		 * instead of falling back to anonymous-shared.
 		 */
-		if (*vm_file_fd < 0)
+		if (*vm_file_fd < 0) {
+			if (prev->e->status & VMA_AREA_IO_URING)
+				vma->e->status = VMA_AREA_IO_URING;
+			else if (prev->e->status & VMA_AREA_AIORING)
+				vma->e->status = VMA_AREA_AIORING;
 			return 0;
+		}
 
 		pr_debug("vma %" PRIx64 " borrows vfi from previous %" PRIx64 "\n", vma->e->start, prev->e->start);
 		if (prev->e->status & VMA_AREA_SOCKET)
@@ -2091,16 +2103,16 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 			continue;
 		}
 		if (fdinfo_field(str, "SqThread")) {
+			IoUringFileEntry *iour = arg;
 			int t;
 
 			if (type != FD_TYPES__IO_URING)
 				goto parse_err;
 			if (sscanf(str, "SqThread: %d", &t) != 1)
 				goto parse_err;
-			if (t != -1) {
-				pr_err("io_uring with SQPOLL thread not supported\n");
-				goto parse_err;
-			}
+			/* SqThread != -1 => ring was created with IORING_SETUP_SQPOLL */
+			if (t != -1)
+				iour->setup_flags |= (1U << 1); /* IORING_SETUP_SQPOLL */
 			continue;
 		}
 		if (fdinfo_field(str, "tfd")) {
