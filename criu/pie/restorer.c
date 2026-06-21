@@ -1135,7 +1135,13 @@ static unsigned long parse_hex(const char *p, int len, int *consumed)
 	return v;
 }
 
-static int iour_read_maps(int proc_fd)
+/*
+ * Collect the mapped ranges ABOVE @above into iour_rs/iour_re (ascending, as
+ * /proc/self/maps already is). Only ranges above the target matter for steering
+ * the top-down allocator, so this is bounded by the few mappings above the (high)
+ * io_uring ring regardless of how many VMAs the process has. Returns count, or -1.
+ */
+static int iour_read_maps(int proc_fd, unsigned long above)
 {
 	char buf[4096];
 	int mfd, rd, n = 0, leftover = 0;
@@ -1158,7 +1164,7 @@ static int iour_read_maps(int proc_fd)
 			e = 0;
 			if (ls + c1 < i && buf[ls + c1] == '-')
 				e = parse_hex(buf + ls + c1 + 1, i - (ls + c1 + 1), &c2);
-			if (e > s) {
+			if (e > s && e > above) {
 				if (n >= IOUR_MAX_RANGES) {
 					sys_close(mfd);
 					return -1;
@@ -1182,8 +1188,7 @@ static int iour_read_maps(int proc_fd)
 	return n;
 }
 
-#define IOUR_MAX_GUARDS 4096
-#define IOUR_MIN_ADDR 0x10000UL
+#define IOUR_MAX_GUARDS 1024
 
 static int iour_fill(unsigned long lo, unsigned long hi, unsigned long *gs, unsigned long *gl, int *ng)
 {
@@ -1195,7 +1200,7 @@ static int iour_fill(unsigned long lo, unsigned long hi, unsigned long *gs, unsi
 		return -1;
 	r = sys_mmap((void *)lo, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 	if (r != lo)
-		return 0; /* couldn't reserve (already mapped / min_addr) — skip */
+		return 0; /* couldn't reserve (already mapped) — skip */
 	gs[*ng] = lo;
 	gl[*ng] = hi - lo;
 	(*ng)++;
@@ -1204,41 +1209,35 @@ static int iour_fill(unsigned long lo, unsigned long hi, unsigned long *gs, unsi
 
 /*
  * Place the io_uring ring fd's mapping (len bytes at file offset off) at its
- * original VA T. The kernel won't honor an addr, so we fill EVERY free gap
- * except [T, T+len) with PROT_NONE guards, leaving exactly one place for
- * mmap(NULL) to land (direction-agnostic), then drop the guards.
+ * original VA T. The kernel won't honor an addr/MAP_FIXED for io_uring, so we
+ * steer the x86-64 top-down allocator: free the placeholder hole at [T, T+len)
+ * and PROT_NONE-fill every free gap ABOVE it (up to task_size), leaving the hole
+ * as the highest free region so mmap(NULL) on the ring fd lands exactly there.
+ * Then drop the guards. Only ranges above T are touched, so this scales to any
+ * number of VMAs.
  */
 static int steer_place_iour(int proc_fd, int fd, unsigned long T, unsigned long len, unsigned long off,
 			    unsigned long task_size)
 {
 	static unsigned long gs[IOUR_MAX_GUARDS], gl[IOUR_MAX_GUARDS];
 	int n, i, ng = 0, ok;
-	unsigned long prev = IOUR_MIN_ADDR, hole_lo = T, hole_hi = T + len, ring;
+	unsigned long prev = T + len, ring;
 
-	/* Free the placeholder so [T, T+len) is the only hole. */
+	/* Free the placeholder so [T, T+len) is a hole. */
 	sys_munmap((void *)T, len);
 
-	n = iour_read_maps(proc_fd);
+	n = iour_read_maps(proc_fd, T);
 	if (n < 0) {
-		pr_err("io_uring steer: maps read failed (>%d ranges?)\n", IOUR_MAX_RANGES);
+		pr_err("io_uring steer: too many mappings above %lx (>%d)\n", T, IOUR_MAX_RANGES);
 		return -1;
 	}
 
+	/* Block every free gap in (T+len, task_size) so T's hole is the top free region. */
 	for (i = 0; i <= n; i++) {
 		unsigned long gstart = (i < n) ? iour_rs[i] : task_size;
-		unsigned long lo = prev, hi = gstart;
 
-		if (hi > lo) {
-			/* fill [lo, hi) but carve out the target hole [hole_lo, hole_hi) */
-			if (lo < hole_hi && hi > hole_lo) {
-				if (iour_fill(lo, hole_lo, gs, gl, &ng) < 0)
-					goto too_many;
-				if (iour_fill(hole_hi, hi, gs, gl, &ng) < 0)
-					goto too_many;
-			} else if (iour_fill(lo, hi, gs, gl, &ng) < 0) {
-				goto too_many;
-			}
-		}
+		if (gstart > prev && iour_fill(prev, gstart, gs, gl, &ng) < 0)
+			goto too_many;
 		if (i < n && iour_re[i] > prev)
 			prev = iour_re[i];
 	}
@@ -1248,8 +1247,6 @@ static int steer_place_iour(int proc_fd, int fd, unsigned long T, unsigned long 
 	if (!ok)
 		pr_err("io_uring steer: ring landed at %lx want %lx (n=%d guards=%d fd=%d off=%lx)\n",
 		       (unsigned long)ring, T, n, ng, fd, off);
-	else
-		pr_info("io_uring steer: ring placed at %lx (guards=%d)\n", T, ng);
 
 	for (i = 0; i < ng; i++)
 		sys_munmap((void *)gs[i], gl[i]);
@@ -1257,7 +1254,7 @@ static int steer_place_iour(int proc_fd, int fd, unsigned long T, unsigned long 
 	return ok ? 0 : -1;
 
 too_many:
-	pr_err("io_uring steer: too many guard gaps (>%d)\n", IOUR_MAX_GUARDS);
+	pr_err("io_uring steer: too many guard gaps above %lx (>%d)\n", T, IOUR_MAX_GUARDS);
 	for (i = 0; i < ng; i++)
 		sys_munmap((void *)gs[i], gl[i]);
 	return -1;
