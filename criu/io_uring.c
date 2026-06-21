@@ -1,4 +1,6 @@
 #include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/io_uring.h>
 
 #include "protobuf.h"
 #include "images/io_uring.pb-c.h"
@@ -7,6 +9,9 @@
 #include "files.h"
 #include "imgset.h"
 #include "io_uring.h"
+#include "restorer.h"
+#include "rst-malloc.h"
+#include "pstree.h"
 #include "log.h"
 
 #undef LOG_PREFIX
@@ -46,3 +51,92 @@ const struct fdtype_ops io_uring_dump_ops = {
 	.type = FD_TYPES__IO_URING,
 	.dump = dump_one_io_uring,
 };
+
+struct io_uring_info {
+	IoUringFileEntry *ioure;
+	struct file_desc d;
+	int uring_fd;
+	struct list_head rlist;
+};
+
+static LIST_HEAD(rst_io_urings);
+
+static int io_uring_open(struct file_desc *d, int *new_fd)
+{
+	struct io_uring_info *info;
+	IoUringFileEntry *ioure;
+	struct io_uring_params p;
+	int tmp;
+
+	info = container_of(d, struct io_uring_info, d);
+	ioure = info->ioure;
+
+	memset(&p, 0, sizeof(p));
+	p.flags = ioure->setup_flags;
+
+	pr_info("Creating io_uring id %#x sq_entries %u flags %#x\n", ioure->id, ioure->sq_entries, ioure->setup_flags);
+
+	tmp = syscall(__NR_io_uring_setup, ioure->sq_entries, &p);
+	if (tmp < 0) {
+		pr_perror("Can't io_uring_setup for %#x", ioure->id);
+		return -1;
+	}
+
+	if (rst_file_params(tmp, ioure->fown, ioure->flags)) {
+		pr_perror("Can't restore params for %#x", ioure->id);
+		close(tmp);
+		return -1;
+	}
+
+	info->uring_fd = file_master(d)->fe->fd;
+	list_add_tail(&info->rlist, &rst_io_urings);
+
+	*new_fd = tmp;
+	return 0;
+}
+
+static struct file_desc_ops io_uring_desc_ops = {
+	.type = FD_TYPES__IO_URING,
+	.open = io_uring_open,
+};
+
+static int collect_one_io_uring(void *o, ProtobufCMessage *msg, struct cr_img *i)
+{
+	struct io_uring_info *info = o;
+
+	info->ioure = pb_msg(msg, IoUringFileEntry);
+	info->uring_fd = -1;
+
+	return file_desc_add(&info->d, info->ioure->id, &io_uring_desc_ops);
+}
+
+struct collect_image_info io_uring_cinfo = {
+	.fd_type = CR_FD_FILES,
+	.pb_type = PB_FILE,
+	.priv_size = sizeof(struct io_uring_info),
+	.collect = collect_one_io_uring,
+};
+
+/*
+ * The io_uring SQ/CQ ring and SQEs mappings (VMA_AREA_IO_URING) are re-mmap'd
+ * from the restored ring fd in the PIE restorer (see __export_restore_task).
+ * Pass that fd down via task_restore_args. Only one ring per task is supported.
+ */
+int prepare_io_urings(struct task_restore_args *ta)
+{
+	struct io_uring_info *info;
+	int n = 0;
+
+	ta->io_uring_fd = -1;
+	list_for_each_entry(info, &rst_io_urings, rlist) {
+		ta->io_uring_fd = info->uring_fd;
+		n++;
+	}
+
+	if (n > 1) {
+		pr_err("Multiple io_uring rings per task not supported (%d)\n", n);
+		return -1;
+	}
+
+	return 0;
+}

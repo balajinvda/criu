@@ -1108,6 +1108,162 @@ static void rst_tcp_socks_all(struct task_restore_args *ta)
 		rst_tcp_repair_off(&ta->tcp_socks[i]);
 }
 
+/*
+ * io_uring rings can only be mmap'd where the kernel chooses on 6.x
+ * (io_uring_mmu_get_unmapped_area rejects any addr hint or MAP_FIXED). To restore
+ * a ring at its original VA we steer the top-down allocator: free the placeholder
+ * hole, fill every free gap above the target with PROT_NONE guards so mmap(NULL)
+ * is forced into the target hole, then drop the guards.
+ */
+#define IOUR_MAX_RANGES 2048
+static unsigned long iour_rs[IOUR_MAX_RANGES], iour_re[IOUR_MAX_RANGES];
+
+static unsigned long parse_hex(const char *p, int len, int *consumed)
+{
+	unsigned long v = 0;
+	int i = 0;
+
+	for (; i < len; i++) {
+		char c = p[i];
+		if (c >= '0' && c <= '9')
+			v = v * 16 + (c - '0');
+		else if (c >= 'a' && c <= 'f')
+			v = v * 16 + (c - 'a' + 10);
+		else
+			break;
+	}
+	*consumed = i;
+	return v;
+}
+
+static int iour_read_maps(int proc_fd)
+{
+	char buf[4096];
+	int mfd, rd, n = 0, leftover = 0;
+
+	mfd = sys_openat(proc_fd, "self/maps", O_RDONLY, 0);
+	if (mfd < 0)
+		return -1;
+
+	while ((rd = sys_read(mfd, buf + leftover, sizeof(buf) - leftover - 1)) > 0) {
+		int total = leftover + rd, i, ls = 0;
+
+		for (i = 0; i < total; i++) {
+			unsigned long s, e;
+			int c1, c2;
+
+			if (buf[i] != '\n')
+				continue;
+
+			s = parse_hex(buf + ls, i - ls, &c1);
+			e = 0;
+			if (ls + c1 < i && buf[ls + c1] == '-')
+				e = parse_hex(buf + ls + c1 + 1, i - (ls + c1 + 1), &c2);
+			if (e > s) {
+				if (n >= IOUR_MAX_RANGES) {
+					sys_close(mfd);
+					return -1;
+				}
+				iour_rs[n] = s;
+				iour_re[n] = e;
+				n++;
+			}
+			ls = i + 1;
+		}
+
+		leftover = total - ls;
+		if (leftover > 0) {
+			int k;
+			for (k = 0; k < leftover; k++)
+				buf[k] = buf[ls + k];
+		}
+	}
+
+	sys_close(mfd);
+	return n;
+}
+
+#define IOUR_MAX_GUARDS 4096
+#define IOUR_MIN_ADDR 0x10000UL
+
+static int iour_fill(unsigned long lo, unsigned long hi, unsigned long *gs, unsigned long *gl, int *ng)
+{
+	unsigned long r;
+
+	if (hi <= lo)
+		return 0;
+	if (*ng >= IOUR_MAX_GUARDS)
+		return -1;
+	r = sys_mmap((void *)lo, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+	if (r != lo)
+		return 0; /* couldn't reserve (already mapped / min_addr) — skip */
+	gs[*ng] = lo;
+	gl[*ng] = hi - lo;
+	(*ng)++;
+	return 0;
+}
+
+/*
+ * Place the io_uring ring fd's mapping (len bytes at file offset off) at its
+ * original VA T. The kernel won't honor an addr, so we fill EVERY free gap
+ * except [T, T+len) with PROT_NONE guards, leaving exactly one place for
+ * mmap(NULL) to land (direction-agnostic), then drop the guards.
+ */
+static int steer_place_iour(int proc_fd, int fd, unsigned long T, unsigned long len, unsigned long off,
+			    unsigned long task_size)
+{
+	static unsigned long gs[IOUR_MAX_GUARDS], gl[IOUR_MAX_GUARDS];
+	int n, i, ng = 0, ok;
+	unsigned long prev = IOUR_MIN_ADDR, hole_lo = T, hole_hi = T + len, ring;
+
+	/* Free the placeholder so [T, T+len) is the only hole. */
+	sys_munmap((void *)T, len);
+
+	n = iour_read_maps(proc_fd);
+	if (n < 0) {
+		pr_err("io_uring steer: maps read failed (>%d ranges?)\n", IOUR_MAX_RANGES);
+		return -1;
+	}
+
+	for (i = 0; i <= n; i++) {
+		unsigned long gstart = (i < n) ? iour_rs[i] : task_size;
+		unsigned long lo = prev, hi = gstart;
+
+		if (hi > lo) {
+			/* fill [lo, hi) but carve out the target hole [hole_lo, hole_hi) */
+			if (lo < hole_hi && hi > hole_lo) {
+				if (iour_fill(lo, hole_lo, gs, gl, &ng) < 0)
+					goto too_many;
+				if (iour_fill(hole_hi, hi, gs, gl, &ng) < 0)
+					goto too_many;
+			} else if (iour_fill(lo, hi, gs, gl, &ng) < 0) {
+				goto too_many;
+			}
+		}
+		if (i < n && iour_re[i] > prev)
+			prev = iour_re[i];
+	}
+
+	ring = sys_mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, off);
+	ok = (ring == T);
+	if (!ok)
+		pr_err("io_uring steer: ring landed at %lx want %lx (n=%d guards=%d fd=%d off=%lx)\n",
+		       (unsigned long)ring, T, n, ng, fd, off);
+	else
+		pr_info("io_uring steer: ring placed at %lx (guards=%d)\n", T, ng);
+
+	for (i = 0; i < ng; i++)
+		sys_munmap((void *)gs[i], gl[i]);
+
+	return ok ? 0 : -1;
+
+too_many:
+	pr_err("io_uring steer: too many guard gaps (>%d)\n", IOUR_MAX_GUARDS);
+	for (i = 0; i < ng; i++)
+		sys_munmap((void *)gs[i], gl[i]);
+	return -1;
+}
+
 static int enable_uffd(int uffd, unsigned long addr, unsigned long len)
 {
 	int rc;
@@ -2476,6 +2632,24 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	for (i = 0; i < args->rings_n; i++)
 		if (restore_aio_ring(&args->rings[i]) < 0)
 			goto core_restore_end;
+
+	/*
+	 * Re-map the io_uring SQ/CQ ring and SQEs over their premapped anonymous
+	 * areas, now backed by the restored ring fd at the recorded offsets.
+	 */
+	if (args->io_uring_fd >= 0) {
+		/* Highest VA first so a placed ring is already mapped when steering lower ones. */
+		for (i = args->vmas_n - 1; i >= 0; i--) {
+			VmaEntry *vma_entry = args->vmas + i;
+
+			if (!vma_entry_is(vma_entry, VMA_AREA_IO_URING))
+				continue;
+
+			if (steer_place_iour(args->proc_fd, args->io_uring_fd, vma_entry->start,
+					     vma_entry_len(vma_entry), vma_entry->pgoff, args->task_size) < 0)
+				goto core_restore_end;
+		}
+	}
 
 	/*
 	 * Finally restore madivse() bits
