@@ -457,10 +457,12 @@ static int vma_get_mapfile(const char *fname, struct vma_area *vma, DIR *mfd, st
 		 * instead of falling back to anonymous-shared.
 		 */
 		if (*vm_file_fd < 0) {
-			if (prev->e->status & VMA_AREA_IO_URING)
+			if (prev->e->status & VMA_AREA_IO_URING) {
 				vma->e->status = VMA_AREA_IO_URING;
-			else if (prev->e->status & VMA_AREA_AIORING)
+				vma->e->shmid = prev->e->shmid; /* same ring inode */
+			} else if (prev->e->status & VMA_AREA_AIORING) {
 				vma->e->status = VMA_AREA_AIORING;
+			}
 			return 0;
 		}
 
@@ -524,9 +526,12 @@ static int vma_get_mapfile(const char *fname, struct vma_area *vma, DIR *mfd, st
 			}
 
 			if ((buf.st_mode & S_IFMT) == 0 && strstr(fname, IO_URING_FNAME)) {
-				/* io_uring SQ/CQ ring or SQEs mapping (recreated on restore) */
+				/* io_uring SQ/CQ ring or SQEs mapping (recreated on restore).
+				 * Record the ring inode in shmid so restore can map each vma
+				 * from its matching ring fd. */
 				close_safe(vm_file_fd);
 				vma->e->status = VMA_AREA_IO_URING;
+				vma->e->shmid = buf.st_ino;
 				return 0;
 			}
 

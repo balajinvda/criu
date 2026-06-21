@@ -2464,16 +2464,30 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * Re-map the io_uring SQ/CQ ring and SQEs over their premapped anonymous
 	 * areas, now backed by the restored ring fd at the recorded offsets.
 	 */
-	if (args->io_uring_fd >= 0) {
+	if (args->iour_rings_n) {
 		/* Highest VA first so a placed ring is already mapped when steering lower ones. */
 		for (i = args->vmas_n - 1; i >= 0; i--) {
 			VmaEntry *vma_entry = args->vmas + i;
+			int fd = -1, j;
 
 			if (!vma_entry_is(vma_entry, VMA_AREA_IO_URING))
 				continue;
 
-			if (steer_place_iour(args->proc_fd, args->io_uring_fd, vma_entry->start,
-					     vma_entry_len(vma_entry), vma_entry->pgoff, args->task_size) < 0)
+			/* Pick the ring fd whose inode matches this vma (shmid). */
+			for (j = 0; j < args->iour_rings_n; j++) {
+				if (args->iour_rings[j].ino == vma_entry->shmid) {
+					fd = args->iour_rings[j].fd;
+					break;
+				}
+			}
+			if (fd < 0) {
+				pr_err("io_uring: no restored ring for vma %lx ino %lx\n",
+				       (unsigned long)vma_entry->start, (unsigned long)vma_entry->shmid);
+				goto core_restore_end;
+			}
+
+			if (steer_place_iour(args->proc_fd, fd, vma_entry->start, vma_entry_len(vma_entry),
+					     vma_entry->pgoff, args->task_size) < 0)
 				goto core_restore_end;
 		}
 	}

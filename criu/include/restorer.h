@@ -143,6 +143,12 @@ struct restore_vma_io {
 
 #define RIO_SIZE(niovs) (sizeof(struct restore_vma_io) + (niovs) * sizeof(struct iovec))
 
+/* A restored io_uring ring: its anon_inode inode (matches the vma shmid) and fd. */
+struct rst_iour {
+	unsigned long ino;
+	int fd;
+};
+
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */
 
@@ -187,8 +193,10 @@ struct task_restore_args {
 	struct rst_aio_ring *rings;
 	unsigned int rings_n;
 
-	/* Restored io_uring ring fd; VMA_AREA_IO_URING mappings are re-mmap'd from it. */
-	int io_uring_fd;
+	/* Restored io_uring rings; VMA_AREA_IO_URING mappings are re-mmap'd from the
+	 * ring whose inode matches the vma's shmid. */
+	struct rst_iour *iour_rings;
+	unsigned int iour_rings_n;
 
 	struct rlimit64 *rlims;
 	unsigned int rlims_n;
