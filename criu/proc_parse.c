@@ -2648,10 +2648,37 @@ int parse_threads(int pid, struct pid **_t, int *_n)
 
 	while ((de = readdir(dir))) {
 		struct pid *tmp;
+		int cfd;
+		char comm[16];
 
 		/* We expect numbers only here */
 		if (de->d_name[0] == '.')
 			continue;
+
+		/*
+		 * Skip io_uring worker threads (iou-sqp-*, iou-wrk-*). They are
+		 * kernel-managed PF_IO_WORKER threads that can't be ptrace-dumped and
+		 * are recreated by io_uring_setup()/io-wq on restore. Excluding them
+		 * here (the common thread enumerator) keeps the dumped and restored
+		 * thread counts consistent for both paths.
+		 */
+		cfd = openat(dirfd(dir), de->d_name, O_RDONLY | O_DIRECTORY);
+		if (cfd >= 0) {
+			int n, ok = 0;
+			int ffd = openat(cfd, "comm", O_RDONLY);
+
+			close(cfd);
+			if (ffd >= 0) {
+				n = read(ffd, comm, sizeof(comm) - 1);
+				close(ffd);
+				if (n > 0) {
+					comm[n] = 0;
+					ok = !strncmp(comm, "iou-", 4);
+				}
+			}
+			if (ok)
+				continue;
+		}
 
 		if (*_t == NULL) {
 			tmp = xrealloc(t, nr * sizeof(struct pid));
