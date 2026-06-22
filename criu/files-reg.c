@@ -1412,6 +1412,15 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms, 
 
 		if (errno == ENOENT) {
 			link_strip_deleted(link);
+			/*
+			 * With --ghost-links the unlinked-but-open file is
+			 * dumped as a ghost (contents inside the image) rather
+			 * than a link-remap (a hard link left on the dump
+			 * filesystem). The latter is invisible to a restore on
+			 * a different filesystem, which breaks fan-out restore.
+			 */
+			if (opts.ghost_links)
+				return dump_ghost_remap(rpath + 1, ost, lfd, id, nsid);
 			ret = dump_linked_remap(rpath + 1, plen - 1, parms, lfd, id, nsid, &fallback);
 			if (ret < 0 && fallback) {
 				/* fallback is true only if following conditions are true:

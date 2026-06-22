@@ -147,6 +147,7 @@ struct cr_options {
 	int tcp_close;
 	int evasive_devices;
 	int link_remap_ok;
+	int ghost_links;
 	int log_file_per_pid;
 	int pre_dump_mode;
 	bool swrk_restore;
