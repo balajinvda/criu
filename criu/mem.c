@@ -1560,6 +1560,28 @@ int prepare_mappings(struct pstree_item *t)
 	if (ret < 0)
 		goto out;
 
+	/*
+	 * Opt the just-premapped private-VMA arena into transparent huge pages
+	 * BEFORE restore_priv_vma_content() faults the pages in. Populating
+	 * multi-GB of process memory as 4KB pages is the bulk of restore time;
+	 * under MADV_HUGEPAGE the content faults allocate 2MB pages, cutting the
+	 * fault count ~500x.
+	 *
+	 * Best-effort by design: MADV_HUGEPAGE is a hint and restore correctness
+	 * never depends on it, so the return value is ignored. Degradation by
+	 * node THP policy: `madvise` -> huge pages (the win); `always` ->
+	 * redundant; `never` or a kernel without CONFIG_TRANSPARENT_HUGEPAGE ->
+	 * silent no-op, restore proceeds with normal pages. Skipped when
+	 * lazy_pages is on, where maybe_disable_thp() intentionally turns THP
+	 * off for the uffd-monitored areas.
+	 */
+	if (!opts.lazy_pages) {
+		unsigned long used = (unsigned long)addr - (unsigned long)rsti(t)->premmapped_addr;
+
+		if (used)
+			madvise(rsti(t)->premmapped_addr, used, MADV_HUGEPAGE);
+	}
+
 	pr.reset(&pr);
 
 	ret = restore_priv_vma_content(t, &pr);
