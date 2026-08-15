@@ -47,6 +47,7 @@
 
 #include "cr-errno.h"
 #include "namespaces.h"
+#include "compression.h"
 
 unsigned int service_sk_ino = -1;
 
@@ -551,6 +552,19 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		}
 	}
 
+	if (req->has_image_io_mode) {
+		switch (req->image_io_mode) {
+		case CRIU_IMAGE_IO_MODE__IMAGE_IO_WRITEBACK:
+			opts.image_io_mode = IMAGE_IO_WRITEBACK;
+			break;
+		case CRIU_IMAGE_IO_MODE__IMAGE_IO_DIRECT:
+			opts.image_io_mode = IMAGE_IO_DIRECT;
+			break;
+		default:
+			goto err;
+		}
+	}
+
 	if (req->ps) {
 		opts.port = (short)req->ps->port;
 
@@ -823,6 +837,64 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (req->mntns_compat_mode)
 		opts.mntns_compat_mode = true;
+
+	if (req->has_compress) {
+		if (req->compress > COMPRESS_REGION) {
+			pr_err("Invalid compress value %u\n", req->compress);
+			goto err;
+		}
+		opts.compress_mode = req->compress;
+		if (req->compress == COMPRESS_OFF) {
+			/*
+			 * An explicit RPC setting has precedence over values loaded
+			 * from the service configuration. libcriu clears the related
+			 * request fields when compression is disabled; reject a raw
+			 * RPC request which asks for both settings at once.
+			 */
+			if (req->has_compress_acceleration ||
+			    req->has_compress_region_size) {
+				pr_err("compress=off conflicts with compression tuning options\n");
+				goto err;
+			}
+			opts.compress_acceleration = 0;
+			opts.compress_region_size = 0;
+		}
+	}
+
+	if (req->has_compress_acceleration) {
+		if (req->compress_acceleration < 1 ||
+		    req->compress_acceleration > LZ4_MAX_ACCELERATION) {
+			pr_err("Invalid compress_acceleration value %u (must be 1..%d)\n",
+			       req->compress_acceleration, LZ4_MAX_ACCELERATION);
+			goto err;
+		}
+		opts.compress_acceleration = req->compress_acceleration;
+	}
+
+	if (req->has_compress_region_size) {
+		if (req->compress_region_size == 0 ||
+		    req->compress_region_size % PAGE_SIZE != 0 ||
+		    req->compress_region_size > MAX_REGION_SIZE) {
+			pr_err("Invalid compress_region_size value %u\n",
+			       req->compress_region_size);
+			goto err;
+		}
+		if (opts.compress_mode == COMPRESS_PER_PAGE) {
+			pr_err("compress_region_size conflicts with compress=per-page\n");
+			goto err;
+		}
+		opts.compress_region_size = req->compress_region_size;
+		opts.compress_mode = COMPRESS_REGION;
+	}
+
+	if (req->has_decompress_threads) {
+		if (req->decompress_threads > 1024) {
+			pr_err("Invalid decompress_threads value %u (must be 0..1024)\n",
+			       req->decompress_threads);
+			goto err;
+		}
+		opts.decompress_threads = req->decompress_threads;
+	}
 
 	if (check_options())
 		goto err;
@@ -1214,6 +1286,8 @@ static int handle_feature_check(int sk, CriuReq *msg)
 	feat.lazy_pages = false;
 	feat.has_pidfd_store = 1;
 	feat.pidfd_store = false;
+	feat.has_mem_compression = 1;
+	feat.mem_compression = false;
 
 	pid = fork();
 	if (pid < 0) {
@@ -1235,6 +1309,13 @@ static int handle_feature_check(int sk, CriuReq *msg)
 
 		if ((msg->features->has_pidfd_store == 1) && (msg->features->pidfd_store == true))
 			feat.pidfd_store = kdat.has_pidfd_getfd && kdat.has_pidfd_open;
+
+		if ((msg->features->has_mem_compression == 1) &&
+		    (msg->features->mem_compression == true)) {
+#ifdef CONFIG_LZ4
+			feat.mem_compression = true;
+#endif
+		}
 
 		resp.features = &feat;
 		resp.type = msg->type;
@@ -1534,11 +1615,15 @@ int cr_service(bool daemon_mode)
 
 		pr_info("The service socket is bound to %s\n", server_addr.sun_path);
 
-		/* change service socket permissions, so anyone can connect to it */
-		if (chmod(server_addr.sun_path, 0666)) {
+		/* restrict service socket permissions to owner only */
+		if (chmod(server_addr.sun_path, 0600)) {
 			pr_perror("Can't change permissions of the service socket");
 			goto err;
 		}
+
+		pr_msg("Service socket %s has permissions 0600. "
+		       "Use chmod to make it accessible to other users if needed.\n",
+		       server_addr.sun_path);
 
 		if (listen(server_fd, 16) == -1) {
 			pr_perror("Can't listen for socket connections");

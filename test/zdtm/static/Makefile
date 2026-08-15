@@ -4,6 +4,11 @@ LDLIBS	+= $(LIB)
 CPPFLAGS += -I$(LIBDIR)
 
 TST_NOFILE	:=				\
+		pages_content01			\
+		pages_content03			\
+		compress_pages01			\
+		compress_pages_region01			\
+		compress_pages_region03			\
 		busyloop00			\
 		sleeping00			\
 		pid00				\
@@ -226,7 +231,10 @@ TST_NOFILE	:=				\
 		scm04				\
 		scm05				\
 		scm06				\
+		scm07				\
+		scm08				\
 		scm09				\
+		scm10				\
 		aio00				\
 		aio01				\
 		fd				\
@@ -320,6 +328,12 @@ ifeq ($(ARCH),s390)
 endif
 
 TST_FILE	=				\
+			pages_content00		\
+			pages_content02		\
+			compress_pages00		\
+			compress_pages02		\
+			compress_pages_region00		\
+			compress_pages_region02		\
 		maps06				\
 		write_read00			\
 		write_read01			\
@@ -332,6 +346,7 @@ TST_FILE	=				\
 		deleted_unix_sock		\
 		sk-unix-rel			\
 		sk-unix-rel-seqpacket		\
+		sk-unix-ucred			\
 		deleted_dev			\
 		unlink_fstat00			\
 		unlink_fstat01			\
@@ -472,6 +487,7 @@ TST_DIR		=				\
 		sk-unix-mntns			\
 		sk-unix01			\
 		sk-unix01-seqpacket		\
+		sk-unix-dgram-cred          \
 		sk-unix-dgram-ghost		\
 		unsupported_children_collision  \
 		shared_slave_mount_children	\
@@ -661,7 +677,9 @@ vdso01:			LDLIBS += -lrt
 scm01:			CFLAGS += -DKEEP_SENT_FD
 scm02:			CFLAGS += -DSEND_BOTH
 scm04:			CFLAGS += -DSEPARATE
+scm08:			CFLAGS += -DSEND_ANOTHER_FD
 scm09:			CFLAGS += -DCLOSE_SENDER_FD
+scm10:			CFLAGS += -DCLOSE_SENDER_FD
 mntns_link_remap:	CFLAGS += -DZDTM_LINK_REMAP
 mntns_shared_bind02:	CFLAGS += -DSHARED_BIND02
 mntns_root_bind02:	CFLAGS += -DROOT_BIND02

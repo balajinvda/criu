@@ -1,6 +1,12 @@
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 #include <linux/io_uring.h>
+
+/* Added in kernel 6.6; may be absent from the build's uapi headers. */
+#ifndef IORING_SETUP_NO_SQARRAY
+#define IORING_SETUP_NO_SQARRAY (1U << 16)
+#endif
 
 #include "protobuf.h"
 #include "images/io_uring.pb-c.h"
@@ -80,6 +86,39 @@ static int io_uring_open(struct file_desc *d, int *new_fd)
 	if (tmp < 0) {
 		pr_perror("Can't io_uring_setup for %#x", ioure->id);
 		return -1;
+	}
+
+	/*
+	 * Reconstruct the SQ array (slot -> SQE index map). The kernel zeroes a
+	 * fresh ring's SQ array; liburing/libuv write the identity map
+	 * (array[i] = i) once at setup and never change it, so the dump never
+	 * captured it and the VMA remap onto this fresh ring leaves it zeroed.
+	 * Without this, every submission resolves to SQE 0: the SQPOLL poller
+	 * processes the wrong/duplicate SQE, the expected completions never
+	 * arrive, and libuv aborts in uv__epoll_ctl_flush (assert want == 0).
+	 * We map the same ring fd the restored task will remap, so the identity
+	 * map we write here is exactly what it sees. NO_SQARRAY rings have no
+	 * array to init (and we never request that flag).
+	 */
+	if (!(p.flags & IORING_SETUP_NO_SQARRAY)) {
+		size_t sqr_len = (size_t)p.sq_off.array + (size_t)p.sq_entries * sizeof(__u32);
+		__u32 *array;
+		void *sqr;
+		__u32 i;
+
+		sqr = mmap(NULL, sqr_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, tmp,
+			   IORING_OFF_SQ_RING);
+		if (sqr == MAP_FAILED) {
+			pr_perror("io_uring: can't map SQ ring to init sq_array for %#x", ioure->id);
+			close(tmp);
+			return -1;
+		}
+		array = (__u32 *)((char *)sqr + p.sq_off.array);
+		for (i = 0; i < p.sq_entries; i++)
+			array[i] = i;
+		munmap(sqr, sqr_len);
+
+		pr_info("Initialized sq_array identity for id %#x (%u entries)\n", ioure->id, p.sq_entries);
 	}
 
 	if (rst_file_params(tmp, ioure->fown, ioure->flags)) {

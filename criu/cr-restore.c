@@ -50,6 +50,7 @@
 #include "uffd.h"
 #include "namespaces.h"
 #include "asyncd.h"
+#include "compression.h"
 #include "mem.h"
 #include "mount.h"
 #include "fsnotify.h"
@@ -357,6 +358,10 @@ static int root_prepare_shared(void)
 	 * fdescs and fles prepared BUT post-prep-s not run.
 	 */
 	ret = prepare_scms();
+	if (ret)
+		goto err;
+
+	ret = add_fake_unix_queuers_finish();
 	if (ret)
 		goto err;
 
@@ -2399,6 +2404,9 @@ int prepare_task_entries(void)
 	mutex_init(&task_entries->userns_sync_lock);
 	mutex_init(&task_entries->cgroupd_sync_lock);
 	mutex_init(&task_entries->last_pid_mutex);
+	decompression_shared_budget_init(&task_entries->decompression_budget,
+					 opts.decompress_threads);
+	decompression_use_shared_budget(&task_entries->decompression_budget);
 
 	return 0;
 }
@@ -3407,6 +3415,18 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	RST_MEM_FIXUP_PPTR(task_args->helpers);
 	RST_MEM_FIXUP_PPTR(task_args->zombies);
 	RST_MEM_FIXUP_PPTR(task_args->vma_ios);
+	{
+		struct restore_vma_io *rio = task_args->vma_ios;
+		unsigned int n;
+
+		for (n = 0; n < task_args->vma_ios_n; n++) {
+			if (rio->compressed_size)
+				RST_MEM_FIXUP_PPTR(rio->compressed_size);
+			if (rio->block_pages)
+				RST_MEM_FIXUP_PPTR(rio->block_pages);
+			rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs));
+		}
+	}
 	RST_MEM_FIXUP_PPTR(task_args->inotify_fds);
 
 	task_args->compatible_mode = core_is_compat(core);

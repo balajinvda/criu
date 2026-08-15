@@ -68,9 +68,20 @@ static inline int ppb_resize_pipe(struct page_pipe_buf *ppb)
 	return 0;
 }
 
+static inline unsigned int ppb_type(unsigned int ppb_flags)
+{
+	unsigned int type = 0;
+
+	if (ppb_flags & PPB_LAZY && opts.lazy_pages)
+		type |= PPB_LAZY;
+	if (ppb_flags & PPB_FORCE_RAW)
+		type |= PPB_FORCE_RAW;
+
+	return type;
+}
+
 static struct page_pipe_buf *pp_prev_ppb(struct page_pipe *pp, unsigned int ppb_flags)
 {
-	int type = 0;
 
 	/* don't allow to reuse a pipe in the PP_CHUNK_MODE mode */
 	if (pp->flags & PP_CHUNK_MODE)
@@ -79,20 +90,12 @@ static struct page_pipe_buf *pp_prev_ppb(struct page_pipe *pp, unsigned int ppb_
 	if (list_empty(&pp->bufs))
 		return NULL;
 
-	if (ppb_flags & PPB_LAZY && opts.lazy_pages)
-		type = 1;
-
-	return pp->prev[type];
+	return pp->prev[ppb_type(ppb_flags)];
 }
 
 static void pp_update_prev_ppb(struct page_pipe *pp, struct page_pipe_buf *ppb, unsigned int ppb_flags)
 {
-	int type = 0;
-
-	if (ppb_flags & PPB_LAZY && opts.lazy_pages)
-		type = 1;
-
-	pp->prev[type] = ppb;
+	pp->prev[ppb_type(ppb_flags)] = ppb;
 }
 
 static struct page_pipe_buf *ppb_alloc(struct page_pipe *pp, unsigned int ppb_flags)
@@ -261,7 +264,7 @@ static inline int try_add_page_to(struct page_pipe *pp, struct page_pipe_buf *pp
 	if (ppb_resize_pipe(ppb) == 1)
 		return 1;
 
-	if (ppb->nr_segs && iov_grow_page(&ppb->iov[ppb->nr_segs - 1], addr))
+	if (!pp->break_iov && ppb->nr_segs && iov_grow_page(&ppb->iov[ppb->nr_segs - 1], addr))
 		goto out;
 
 	pr_debug("Add iov to page pipe (%u iovs, %u/%u total)\n", ppb->nr_segs, pp->free_iov, pp->nr_iovs);
@@ -269,6 +272,8 @@ static inline int try_add_page_to(struct page_pipe *pp, struct page_pipe_buf *pp
 	pp->free_iov++;
 	BUG_ON(pp->free_iov > pp->nr_iovs);
 out:
+	/* Consume the one-shot iov break once a page has been added. */
+	pp->break_iov = false;
 	ppb->pages_in++;
 	return 0;
 }

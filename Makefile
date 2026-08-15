@@ -237,6 +237,7 @@ else
 export CONFIG_COMPAT := y
 export CONFIG_GNUTLS := y
 export CONFIG_HAS_LIBBPF := y
+export CONFIG_LZ4 := y
 endif
 
 #
@@ -458,13 +459,17 @@ ruff:
 		lib/pycriu/images/pb2dict.py \
 		lib/pycriu/images/images.py \
 		scripts/criu-ns \
+		scripts/magic-gen.py \
 		test/others/criu-ns/run.py \
 		crit/*.py \
 		crit/crit/*.py \
+		test/others/crit/*.py \
 		scripts/uninstall_module.py \
 		coredump/ coredump/coredump \
 		scripts/github-indent-warnings.py \
-		contrib/criu-service-client/test/*.py
+		contrib/criu-service-client/test/*.py \
+		contrib/compression-benchmark/ \
+		test/others/compression/
 
 shellcheck:
 	shellcheck --version
@@ -477,6 +482,7 @@ shellcheck:
 	shellcheck -x test/others/config-file/*.sh
 	shellcheck -x test/others/action-script/*.sh
 	shellcheck -x contrib/criu-service-client/test/*.sh
+	shellcheck -x test/others/compression/*/*.sh
 
 codespell:
 	codespell

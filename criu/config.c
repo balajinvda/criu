@@ -1,6 +1,8 @@
 #include <ctype.h>
+#include <errno.h>
 #include <getopt.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +15,7 @@
 #include "cgroup.h"
 #include "cgroup-props.h"
 #include "common/bug.h"
+#include "compression.h"
 #include "cpu.h"
 #include "crtools.h"
 #include "cr_options.h"
@@ -430,8 +433,10 @@ void init_opts(void)
 	opts.log_level = DEFAULT_LOGLEVEL;
 	opts.pre_dump_mode = PRE_DUMP_SPLICE;
 	opts.file_validation_method = FILE_VALIDATION_DEFAULT;
+	opts.image_io_mode = IMAGE_IO_DEFAULT;
 	opts.network_lock_method = NETWORK_LOCK_DEFAULT;
 	opts.ghost_fiemap = FIEMAP_DEFAULT;
+	opts.decompress_threads = 1;
 }
 
 bool deprecated_ok(char *what)
@@ -549,6 +554,41 @@ static size_t parse_size(char *optarg)
 	return (size_t)atol(optarg);
 }
 
+static int parse_size_strict(const char *value, size_t *size)
+{
+	unsigned long long number, multiplier = 1;
+	char *end;
+
+	if (!value[0] || value[0] < '0' || value[0] > '9')
+		return -1;
+
+	errno = 0;
+	number = strtoull(value, &end, 10);
+	if (errno == ERANGE || end == value)
+		return -1;
+
+	if (*end) {
+		switch (*end++) {
+		case 'K':
+			multiplier = 1024;
+			break;
+		case 'M':
+			multiplier = 1024 * 1024;
+			break;
+		case 'G':
+			multiplier = 1024ULL * 1024 * 1024;
+			break;
+		default:
+			return -1;
+		}
+	}
+	if (*end || number > SIZE_MAX / multiplier)
+		return -1;
+
+	*size = (size_t)(number * multiplier);
+	return 0;
+}
+
 static int parse_join_ns(const char *ptr)
 {
 	char *aux, *ns_file, *extra_opts = NULL;
@@ -593,6 +633,20 @@ Esyntax:
 	return -1;
 }
 
+static int parse_image_io_mode(struct cr_options *opts, const char *optarg)
+{
+	if (!strcmp(optarg, "writeback"))
+		opts->image_io_mode = IMAGE_IO_WRITEBACK;
+	else if (!strcmp(optarg, "direct"))
+		opts->image_io_mode = IMAGE_IO_DIRECT;
+	else {
+		pr_err("Unknown image I/O mode `%s' selected\n", optarg);
+		return -1;
+	}
+
+	return 0;
+}
+
 /*
  * parse_options() is the point where the getopt parsing happens. The CLI
  * parsing as well as the configuration file parsing happens here.
@@ -618,7 +672,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		"no-" OPT_NAME, no_argument, SAVE_TO, false \
 	}
 
-	static const char short_opts[] = "dSsRt:hD:o:v::x::Vr:jJ:lW:L:M:";
+	static const char short_opts[] = "dSscRt:hD:o:v::x::Vr:jJ:lW:L:M:";
 	static struct option long_opts[] = {
 		{ "tree", required_argument, 0, 't' },
 		{ "leave-stopped", no_argument, 0, 's' },
@@ -701,11 +755,16 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT("skip-file-rwx-check", &opts.skip_file_rwx_check),
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
+		{ "image-io-mode", required_argument, 0, 1101 },
 		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
 		BOOL_OPT("unprivileged", &opts.unprivileged),
 		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
 		BOOL_OPT("ghost-links", &opts.ghost_links),
 		BOOL_OPT(OPT_ALLOW_UPROBES, &opts.allow_uprobes),
+		{ "compress",                no_argument,       0, 'c'  },
+		{ "compress-acceleration",   required_argument, 0, 1102 },
+		{ "compress-region",         required_argument, 0, 1103 },
+		{ "decompress-threads",      required_argument, 0, 1104 },
 		{},
 	};
 
@@ -815,6 +874,58 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			} else
 				opts.log_level++;
 			break;
+		case 'c':
+			if (opts.compress_mode == COMPRESS_REGION) {
+				pr_err("--compress conflicts with --compress-region\n");
+				return 1;
+			}
+			opts.compress_mode = COMPRESS_PER_PAGE;
+			break;
+		case 1102: {
+			char *endptr;
+			long accel = strtol(optarg, &endptr, 10);
+
+			if (*endptr != '\0' || accel < 1 || accel > LZ4_MAX_ACCELERATION) {
+				pr_err("Invalid --compress-acceleration value '%s' (must be 1..%d)\n",
+				       optarg, LZ4_MAX_ACCELERATION);
+				return 1;
+			}
+			opts.compress_acceleration = accel;
+			break;
+		}
+		case 1103: {
+			size_t sz;
+
+			if (parse_size_strict(optarg, &sz) || sz == 0 ||
+			    sz % PAGE_SIZE != 0 || sz > MAX_REGION_SIZE) {
+				pr_err("Invalid --compress-region '%s' (must be a multiple of %lu, max %lu)\n",
+				       optarg, (unsigned long)PAGE_SIZE,
+				       MAX_REGION_SIZE);
+				return 1;
+			}
+			if (opts.compress_mode == COMPRESS_PER_PAGE) {
+				pr_err("--compress-region conflicts with --compress\n");
+				return 1;
+			}
+			opts.compress_region_size = sz;
+			opts.compress_mode = COMPRESS_REGION;
+			break;
+		}
+		case 1104: {
+			char *endptr;
+			long n;
+
+			errno = 0;
+			n = strtol(optarg, &endptr, 10);
+			if (errno == ERANGE || endptr == optarg || *endptr != '\0' ||
+			    n < 0 || n > 1024) {
+				pr_err("Invalid --decompress-threads value '%s' (must be 0..1024)\n",
+				       optarg);
+				return 1;
+			}
+			opts.decompress_threads = (unsigned int)n;
+			break;
+		}
 		case 1043: {
 			int fd;
 
@@ -1046,6 +1157,10 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 				return 1;
 			}
 			break;
+		case 1101:
+			if (parse_image_io_mode(&opts, optarg))
+				return 2;
+			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
 			if (strcmp(CRIU_GITID, "0"))
@@ -1077,6 +1192,76 @@ bad_arg:
 
 int check_options(void)
 {
+	/*
+	 * --compress-acceleration (CLI) or compress_acceleration (RPC) on
+	 * their own imply per-page compression. Resolve that here rather
+	 * than while parsing each option, so that passing acceleration
+	 * before --compress-region is not mistaken for a conflict with an
+	 * implicit --compress.
+	 */
+	if (opts.compress_acceleration && opts.compress_mode == COMPRESS_OFF)
+		opts.compress_mode = COMPRESS_PER_PAGE;
+
+	/*
+	 * Compression is selected by the dump client and encoded in each page
+	 * server wire command. Letting the server select a mode independently
+	 * can make the payload disagree with the inventory written by the client.
+	 */
+	if (opts.mode == CR_PAGE_SERVER && opts.compress_mode != COMPRESS_OFF) {
+		pr_err("Memory page compression options apply to the dump client, not the page server\n");
+		return 1;
+	}
+
+	if (opts.compress_mode) {
+#ifndef CONFIG_LZ4
+		pr_err("Memory page compression requires CRIU built with LZ4 support (CONFIG_LZ4)\n");
+		return 1;
+#else
+		if (opts.compress_mode == COMPRESS_REGION) {
+			if (opts.compress_region_size == 0)
+				opts.compress_region_size = DEFAULT_REGION_SIZE;
+			if (opts.compress_region_size % PAGE_SIZE != 0 ||
+			    opts.compress_region_size > MAX_REGION_SIZE) {
+				pr_err("Invalid compress region size %u\n",
+				       opts.compress_region_size);
+				return 1;
+			}
+			pr_debug("Region compression of memory pages is enabled (region=%u bytes)\n",
+				 opts.compress_region_size);
+		} else {
+			pr_debug("Per-page compression of memory pages is enabled\n");
+		}
+#endif
+	}
+
+	/*
+	 * Region compression is currently only implemented for the local
+	 * dump and restore paths. The page-server
+	 * and image-streamer wire formats are per-page; combining them with
+	 * --compress-region would produce an image the receiver cannot read.
+	 * Reject the combination early.
+	 */
+	if (opts.compress_mode == COMPRESS_REGION) {
+		if (opts.use_page_server || opts.addr) {
+			pr_err("--compress-region is not supported with --page-server\n");
+			return 1;
+		}
+		if (opts.stream) {
+			pr_err("--compress-region is not supported with --stream\n");
+			return 1;
+		}
+	}
+
+	/*
+	 * The compressed page-server sender writes its records straight to
+	 * the socket and does not route them through the TLS helpers, so a
+	 * TLS page-server would receive plaintext into the encrypted stream.
+	 * Reject the combination until compressed sends learn to use TLS.
+	 */
+	if (opts.compress_mode && opts.tls && (opts.use_page_server || opts.addr)) {
+		pr_err("Memory page compression is not supported with a TLS page-server\n");
+		return 1;
+	}
 	if (opts.tcp_established_ok)
 		pr_info("Will dump/restore TCP connections\n");
 	if (opts.tcp_skip_in_flight)

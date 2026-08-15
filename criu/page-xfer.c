@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <stdlib.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-xfer: "
@@ -27,6 +28,7 @@
 #include "rst_info.h"
 #include "stats.h"
 #include "tls.h"
+#include "compression.h"
 
 static int page_server_sk = -1;
 
@@ -50,6 +52,7 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_PARENT 5
 #define PS_IOV_ADD_F  6
 #define PS_IOV_GET    7
+#define PS_IOV_ADD_F_COMPRESSED 8
 
 #define PS_IOV_CLOSE	   0x1023
 #define PS_IOV_FORCE_CLOSE 0x1024
@@ -144,6 +147,28 @@ static inline int __recv(int sk, void *buf, size_t sz, int fl)
 	return opts.tls ? tls_recv(buf, sz, fl) : recv(sk, buf, sz, fl);
 }
 
+static int recv_full(int sk, void *buf, size_t size, const char *what)
+{
+	size_t done = 0;
+
+	while (done < size) {
+		ssize_t ret = __recv(sk, (char *)buf + done, size - done, MSG_WAITALL);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			pr_perror("Can't read %s", what);
+			return -1;
+		}
+		if (ret == 0) {
+			pr_err("Unexpected EOF reading %s\n", what);
+			return -1;
+		}
+		done += ret;
+	}
+	return 0;
+}
+
 static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
 {
 	if (__send(sk, pi, sizeof(*pi), flags) != sizeof(*pi)) {
@@ -171,6 +196,8 @@ static void tcp_nodelay(int sk, bool on)
 	if (setsockopt(sk, SOL_TCP, TCP_NODELAY, &val, sizeof(val)))
 		pr_pwarn("Unable to set TCP_NODELAY=%d", val);
 }
+
+static int write_fd_full(int fd, const void *buf, size_t size);
 
 /* page-server xfer */
 static int write_pages_to_server(struct page_xfer *xfer, int p, unsigned long len)
@@ -200,10 +227,78 @@ static int write_pages_to_server(struct page_xfer *xfer, int p, unsigned long le
 	return 0;
 }
 
+/*
+ * Compress pages and send them over the network. For each page,
+ * send a uint32_t compressed size followed by the compressed data.
+ * Zero pages send compressed_size=0 with no data. This avoids
+ * transferring full uncompressed pages over the network.
+ */
+static int write_pages_to_server_compressed(struct page_xfer *xfer, int p, unsigned long len)
+{
+	char buf[PAGE_SIZE], compressed_buf[PAGE_COMPRESSED_SIZE_BOUND];
+	unsigned long off = 0;
+	int acceleration = LZ4_DEFAULT_ACCELERATION;
+
+	if (opts.compress_acceleration)
+		acceleration = opts.compress_acceleration;
+
+	while (off < len) {
+		ssize_t ret;
+		ssize_t cur = 0;
+		uint32_t compressed_size;
+
+		while (cur < PAGE_SIZE) {
+			ret = read(p, buf + cur, PAGE_SIZE - cur);
+			if (ret < 0) {
+				if (errno == EINTR)
+					continue;
+				pr_perror("Unable to read page data");
+				return -1;
+			}
+			if (ret == 0) {
+				pr_err("Pipe closed unexpectedly\n");
+				return -1;
+			}
+			cur += ret;
+		}
+		off += PAGE_SIZE;
+
+		if (page_is_all_zero(buf)) {
+			compressed_size = 0;
+		} else if (xfer->force_raw) {
+			compressed_size = PAGE_SIZE;
+		} else {
+			int r = compress_data(buf, PAGE_SIZE, compressed_buf, PAGE_COMPRESSED_SIZE_BOUND, acceleration);
+			if (r < 0)
+				return -1;
+			compressed_size = (r >= PAGE_COMPRESSION_THRESHOLD) ? PAGE_SIZE : r;
+		}
+
+		/* Send compressed size */
+		if (write_fd_full(xfer->sk, &compressed_size, sizeof(compressed_size)))
+			return -1;
+
+		/* Send page data (compressed, raw, or nothing for zero) */
+		if (compressed_size == 0) {
+			/* Zero page, nothing to send */
+		} else if (compressed_size == PAGE_SIZE) {
+			/* Raw page: incompressible, send the original PAGE_SIZE bytes */
+			if (write_fd_full(xfer->sk, buf, PAGE_SIZE))
+				return -1;
+		} else {
+			/* Compressed page: send the compressed_size-byte LZ4 block */
+			if (write_fd_full(xfer->sk, compressed_buf, compressed_size))
+				return -1;
+		}
+	}
+
+	return 0;
+}
+
 static int write_pagemap_to_server(struct page_xfer *xfer, struct iovec *iov, u32 flags)
 {
 	struct page_server_iov pi = {
-		.cmd = encode_ps_cmd(PS_IOV_ADD_F, flags),
+		.cmd = encode_ps_cmd(opts.compress_mode ? PS_IOV_ADD_F_COMPRESSED : PS_IOV_ADD_F, flags),
 		.nr_pages = iov->iov_len / PAGE_SIZE,
 		.vaddr = encode_pointer(iov->iov_base),
 		.dst_id = xfer->dst_id,
@@ -226,7 +321,7 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 
 	xfer->sk = page_server_sk;
 	xfer->write_pagemap = write_pagemap_to_server;
-	xfer->write_pages = write_pages_to_server;
+	xfer->write_pages = opts.compress_mode ? write_pages_to_server_compressed : write_pages_to_server;
 	xfer->close = close_server_xfer;
 	xfer->dst_id = encode_pm(fd_type, img_id);
 	xfer->parent = NULL;
@@ -252,15 +347,429 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 }
 
 /* local xfer */
+/* Toggle O_DIRECT on the pages image fd. */
+static int set_o_direct(int fd)
+{
+	int fl = fcntl(fd, F_GETFL);
+
+	if (fl < 0)
+		return -1;
+	return fcntl(fd, F_SETFL, fl | O_DIRECT);
+}
+
+static int clear_o_direct(int fd)
+{
+	int fl = fcntl(fd, F_GETFL);
+
+	if (fl < 0)
+		return -1;
+	return fcntl(fd, F_SETFL, fl & ~O_DIRECT);
+}
+
+static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov);
+
+static int write_pagemap_loc_compressed(struct page_xfer *xfer, struct iovec *iov, u32 flags)
+{
+	int ret;
+
+	if (flags & PE_PRESENT) {
+		unsigned long nr_pages;
+		unsigned int region_pages = 0;
+		size_t total_blocks;
+
+		if (opts.auto_dedup && xfer->parent != NULL) {
+			ret = dedup_one_iovec(xfer->parent, encode_pointer(iov->iov_base), iov->iov_len);
+			if (ret == -1) {
+				pr_err("Auto-deduplication failed\n");
+				return ret;
+			}
+		}
+
+		nr_pages = iov->iov_len / PAGE_SIZE;
+		if (opts.compress_mode == COMPRESS_REGION) {
+			region_pages = opts.compress_region_size / PAGE_SIZE;
+			if (region_pages == 0 || region_pages > MAX_REGION_PAGES) {
+				pr_err("Invalid region_pages %u\n", region_pages);
+				return -1;
+			}
+			total_blocks = (nr_pages + region_pages - 1) / region_pages;
+		} else {
+			total_blocks = nr_pages;
+		}
+
+		/* Buffer the entry; write_pages will flush it. */
+		xfer->pending_pe.vaddr = encode_pointer(iov->iov_base);
+		xfer->pending_pe.nr_pages = nr_pages;
+		xfer->pending_pe.flags = flags;
+		xfer->pending_pe.region_pages = region_pages;
+		xfer->pending_pe.total_blocks = total_blocks;
+		xfer->pending_pe.compressed_size = xzalloc(total_blocks * sizeof(uint32_t));
+		if (!xfer->pending_pe.compressed_size)
+			return -1;
+		xfer->pending_pe.n_compressed = 0;
+		xfer->pending_pe.total_compressed_size = 0;
+		xfer->pending_pe.payload_started = false;
+		return 0;
+	}
+
+	/* Non-present pages (holes, parent refs): write immediately */
+	if (flags & PE_PARENT) {
+		if (xfer->parent != NULL) {
+			ret = check_pagehole_in_parent(xfer->parent, iov);
+			if (ret) {
+				pr_err("Hole %p - %p not found in parent\n",
+				       iov->iov_base, iov->iov_base + iov->iov_len);
+				return -1;
+			}
+		}
+	}
+
+	{
+		PagemapEntry pe = PAGEMAP_ENTRY__INIT;
+
+		pe.vaddr = encode_pointer(iov->iov_base);
+		pe.nr_pages = iov->iov_len / PAGE_SIZE;
+		pe.has_flags = true;
+		pe.flags = flags;
+		pe.has_nr_pages = true;
+
+		if (pb_write_one(xfer->pmi, &pe, PB_PAGEMAP) < 0)
+			return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Write exactly @size bytes to @fd, handling short writes and EINTR.
+ */
+static int write_fd_full(int fd, const void *buf, size_t size)
+{
+	size_t done = 0;
+
+	while (done < size) {
+		ssize_t ret = write(fd, (const char *)buf + done, size - done);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			pr_perror("Unable to write image data");
+			return -1;
+		}
+		if (ret == 0) {
+			pr_err("Unable to write image data: wrote 0 bytes\n");
+			return -1;
+		}
+		done += ret;
+	}
+	return 0;
+}
+
+#define PAGE_PADDING_CHUNK 4096
+
+static int account_pages_image_bytes(struct page_xfer *xfer, size_t size)
+{
+	if (size > UINT64_MAX - xfer->pages_image_offset) {
+		pr_err("Pages image offset overflows after %zu bytes\n", size);
+		return -1;
+	}
+	xfer->pages_image_offset += size;
+	return 0;
+}
+
+static int write_pages_image_data(struct page_xfer *xfer, const void *buf, size_t size)
+{
+	if (write_fd_full(img_raw_fd(xfer->pi), buf, size))
+		return -1;
+	return account_pages_image_bytes(xfer, size);
+}
+
+/*
+ * A raw extent restored directly into page-aligned memory is substantially
+ * slower when its pages-image offset has a different page phase.  Mark and
+ * align compression-path entries whose first stored block is raw.  This
+ * includes every entry that later drops compression metadata because all its
+ * blocks fell back to raw storage.
+ */
+static int align_pages_image_payload(struct page_xfer *xfer, u32 *flags)
+{
+	static const char zero[PAGE_PADDING_CHUNK];
+	size_t padding = (PAGE_SIZE - xfer->pages_image_offset % PAGE_SIZE) % PAGE_SIZE;
+
+	while (padding) {
+		size_t chunk = min(padding, sizeof(zero));
+
+		if (write_pages_image_data(xfer, zero, chunk))
+			return -1;
+		padding -= chunk;
+	}
+	*flags |= PE_PAYLOAD_ALIGNED;
+	return 0;
+}
+
+static int write_compressed_payload(struct page_xfer *xfer, const void *buf, size_t size, bool raw)
+{
+	if (!xfer->pending_pe.payload_started) {
+		xfer->pending_pe.payload_started = true;
+		if (raw && align_pages_image_payload(xfer, &xfer->pending_pe.flags))
+			return -1;
+	}
+
+	return write_pages_image_data(xfer, buf, size);
+}
+
+/*
+ * Read exactly @count bytes from @fd into @buf, looping over short reads.
+ */
+static int read_pipe_full(int fd, void *buf, size_t count)
+{
+	size_t done = 0;
+
+	while (done < count) {
+		ssize_t ret = read(fd, (char *)buf + done, count - done);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			pr_perror("Unable to read page data");
+			return -1;
+		}
+		if (ret == 0) {
+			pr_err("A pipe was closed unexpectedly\n");
+			return -1;
+		}
+		done += ret;
+	}
+	return 0;
+}
+
+static bool region_is_all_zero(const char *buf, unsigned int nr_pages)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_pages; i++)
+		if (!page_is_all_zero(buf + (size_t)i * PAGE_SIZE))
+			return false;
+
+	return true;
+}
+
+static bool pending_entry_is_all_raw(const struct page_xfer *xfer)
+{
+	unsigned int region_pages = xfer->pending_pe.region_pages;
+	size_t i;
+
+	for (i = 0; i < xfer->pending_pe.total_blocks; i++) {
+		size_t block_bytes = PAGE_SIZE;
+
+		if (region_pages) {
+			unsigned long pages_done = i * (unsigned long)region_pages;
+			unsigned long pages_left = xfer->pending_pe.nr_pages - pages_done;
+			unsigned int block_pages = pages_left < region_pages ? (unsigned int)pages_left : region_pages;
+
+			block_bytes = (size_t)block_pages * PAGE_SIZE;
+		}
+
+		if (xfer->pending_pe.compressed_size[i] != block_bytes)
+			return false;
+	}
+
+	return true;
+}
+
+static int write_pages_loc_compressed(struct page_xfer *xfer, int p, unsigned long len)
+{
+	unsigned long off = 0;
+	int acceleration = LZ4_DEFAULT_ACCELERATION;
+	unsigned int region_pages = xfer->pending_pe.region_pages;
+
+	if (len / PAGE_SIZE > xfer->pending_pe.nr_pages) {
+		pr_err("write_pages len %lu exceeds pending pagemap (%lu pages)\n", len, xfer->pending_pe.nr_pages);
+		return -1;
+	}
+
+	/*
+	 * LZ4 acceleration controls the speed/ratio tradeoff.
+	 * Value 1 probes the most hash table positions, giving
+	 * the best ratio. Higher values skip more candidates
+	 * for faster but less thorough compression.
+	 */
+	if (opts.compress_acceleration)
+		acceleration = opts.compress_acceleration;
+
+	if (region_pages == 0) {
+		/* Per-page mode: keep the original tight stack-buffered loop. */
+		char buf[PAGE_SIZE], compressed_buf[PAGE_COMPRESSED_SIZE_BOUND];
+
+		while (off < len) {
+			int cs;
+			size_t idx;
+
+			if (read_pipe_full(p, buf, PAGE_SIZE))
+				return -1;
+			off += PAGE_SIZE;
+
+			idx = xfer->pending_pe.n_compressed++;
+
+			if (page_is_all_zero(buf)) {
+				xfer->pending_pe.compressed_size[idx] = 0;
+				continue;
+			}
+			if (xfer->force_raw) {
+				xfer->pending_pe.compressed_size[idx] = PAGE_SIZE;
+				xfer->pending_pe.total_compressed_size += PAGE_SIZE;
+				if (write_compressed_payload(xfer, buf, PAGE_SIZE, true))
+					return -1;
+				continue;
+			}
+
+			cs = compress_data(buf, PAGE_SIZE, compressed_buf, PAGE_COMPRESSED_SIZE_BOUND, acceleration);
+			if (cs < 0)
+				return -1;
+
+			if (cs >= PAGE_COMPRESSION_THRESHOLD) {
+				xfer->pending_pe.compressed_size[idx] = PAGE_SIZE;
+				xfer->pending_pe.total_compressed_size += PAGE_SIZE;
+				if (write_compressed_payload(xfer, buf, PAGE_SIZE, true))
+					return -1;
+			} else {
+				xfer->pending_pe.compressed_size[idx] = cs;
+				xfer->pending_pe.total_compressed_size += cs;
+				if (write_compressed_payload(xfer, compressed_buf, cs, false))
+					return -1;
+			}
+		}
+	} else {
+		/*
+		 * Region mode: accumulate region_pages worth of data and
+		 * compress as one LZ4 block. The last region may be short
+		 * if nr_pages % region_pages != 0.
+		 */
+		size_t region_bytes_max = (size_t)region_pages * PAGE_SIZE;
+		size_t cap = REGION_COMPRESSED_SIZE_BOUND(region_pages);
+		unsigned long pages_done;
+		char *src_buf, *dst_buf;
+		int rc = -1;
+
+		src_buf = xmalloc(region_bytes_max);
+		dst_buf = xfer->force_raw ? NULL : xmalloc(cap);
+		if (!src_buf || (!xfer->force_raw && !dst_buf))
+			goto region_out;
+
+		pages_done = (unsigned long)xfer->pending_pe.n_compressed * region_pages;
+
+		while (off < len) {
+			unsigned long pages_left = xfer->pending_pe.nr_pages - pages_done;
+			unsigned int this_region = pages_left < region_pages ? pages_left : region_pages;
+			size_t region_bytes = (size_t)this_region * PAGE_SIZE;
+			const char *payload = dst_buf;
+			int cs;
+			size_t idx;
+
+			if (off + region_bytes > len) {
+				pr_err("write_pages len mismatch in region mode\n");
+				goto region_out;
+			}
+
+			if (read_pipe_full(p, src_buf, region_bytes))
+				goto region_out;
+			off += region_bytes;
+			pages_done += this_region;
+
+			idx = xfer->pending_pe.n_compressed++;
+
+			if (xfer->force_raw) {
+				if (region_is_all_zero(src_buf, this_region)) {
+					cs = 0;
+				} else {
+					cs = (int)region_bytes;
+					payload = src_buf;
+				}
+			} else {
+				cs = compress_region(src_buf, this_region, dst_buf, cap, acceleration);
+				if (cs < 0)
+					goto region_out;
+			}
+
+			xfer->pending_pe.compressed_size[idx] = cs;
+			xfer->pending_pe.total_compressed_size += cs;
+			if (cs > 0 && write_compressed_payload(xfer, payload, cs, (size_t)cs == region_bytes))
+				goto region_out;
+		}
+
+		rc = 0;
+region_out:
+		xfree(src_buf);
+		xfree(dst_buf);
+		if (rc < 0)
+			return -1;
+	}
+
+	/* When all blocks are compressed, flush the pagemap entry */
+	if (xfer->pending_pe.n_compressed == xfer->pending_pe.total_blocks) {
+		PagemapEntry pe = PAGEMAP_ENTRY__INIT;
+		bool all_raw = pending_entry_is_all_raw(xfer);
+
+		pe.vaddr = xfer->pending_pe.vaddr;
+		pe.nr_pages = xfer->pending_pe.nr_pages;
+		pe.has_flags = true;
+		pe.flags = xfer->pending_pe.flags;
+		pe.has_nr_pages = true;
+		/*
+		 * An entry for which every block fell back to raw has exactly the
+		 * same contiguous payload as an ordinary page image. Omitting the
+		 * compression metadata lets restore take the uncompressed fast path.
+		 */
+		if (!all_raw) {
+			pe.compressed_size = xfer->pending_pe.compressed_size;
+			pe.n_compressed_size = xfer->pending_pe.total_blocks;
+			pe.has_total_compressed_size = true;
+			pe.total_compressed_size = xfer->pending_pe.total_compressed_size;
+
+			if (region_pages > 0) {
+				pe.has_region_pages = true;
+				pe.region_pages = region_pages;
+			}
+		}
+
+		if (pb_write_one(xfer->pmi, &pe, PB_PAGEMAP) < 0)
+			return -1;
+
+		xfree(xfer->pending_pe.compressed_size);
+		xfer->pending_pe.compressed_size = NULL;
+		xfer->pending_pe.payload_started = false;
+	}
+
+	return 0;
+}
+
 static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 {
 	ssize_t ret;
 	ssize_t curr = 0;
+	int img_fd = img_raw_fd(xfer->pi);
 
 	while (1) {
-		ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len - curr, SPLICE_F_MOVE);
+		ret = splice(p, NULL, img_fd, NULL, len - curr, SPLICE_F_MOVE);
 		if (ret == -1) {
-			pr_perror("Unable to spice data");
+			/*
+			 * splice() to an O_DIRECT fd performs direct I/O on
+			 * filesystems that support it (ext4, xfs) and fails with
+			 * EFAULT (or EINVAL) on those that do not. Recover by
+			 * clearing O_DIRECT and retrying the remainder buffered;
+			 * only whole pages were spliced so far, so the file
+			 * offset stays block-aligned across the switch.
+			 */
+			if (xfer->pi_use_direct && (errno == EFAULT || errno == EINVAL)) {
+				pr_warn("splice() rejected O_DIRECT on the pages image, falling back to buffered I/O\n");
+				if (clear_o_direct(img_fd) < 0) {
+					pr_perror("Unable to clear O_DIRECT on the pages image");
+					return -1;
+				}
+				xfer->pi_use_direct = false;
+				continue;
+			}
+			pr_perror("Unable to splice data");
 			return -1;
 		}
 		if (ret == 0) {
@@ -272,7 +781,7 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 			break;
 	}
 
-	return 0;
+	return account_pages_image_bytes(xfer, len);
 }
 
 static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
@@ -361,11 +870,13 @@ static void close_page_xfer(struct page_xfer *xfer)
 		xfree(xfer->parent);
 		xfer->parent = NULL;
 	}
+	xfree(xfer->pending_pe.compressed_size);
+	xfer->pending_pe.compressed_size = NULL;
 	close_image(xfer->pi);
 	close_image(xfer->pmi);
 }
 
-static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
+static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id, bool compress)
 {
 	u32 pages_id;
 
@@ -376,6 +887,13 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
 	if (!xfer->pi)
 		goto err_pmi;
+
+	/*
+	 * Buffered by default. O_DIRECT (--image-io-mode=direct) is enabled
+	 * later by open_page_xfer() for local dump output; page-server receive
+	 * images stay buffered.
+	 */
+	xfer->pi_use_direct = false;
 
 	/*
 	 * Open page-read for parent images (if it exists). It will
@@ -417,8 +935,17 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	}
 
 out:
-	xfer->write_pagemap = write_pagemap_loc;
-	xfer->write_pages = write_pages_loc;
+	xfer->pending_pe.compressed_size = NULL;
+	xfer->pending_pe.payload_started = false;
+	xfer->pages_image_offset = 0;
+	xfer->force_raw = false;
+	if (compress) {
+		xfer->write_pagemap = write_pagemap_loc_compressed;
+		xfer->write_pages = write_pages_loc_compressed;
+	} else {
+		xfer->write_pagemap = write_pagemap_loc;
+		xfer->write_pages = write_pages_loc;
+	}
 	xfer->close = close_page_xfer;
 	return 0;
 
@@ -431,13 +958,32 @@ err_pmi:
 
 int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 {
+	int ret;
+
 	xfer->offset = 0;
 	xfer->transfer_lazy = true;
+	xfer->force_raw = false;
 
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
-	else
-		return open_page_local_xfer(xfer, fd_type, img_id);
+
+	ret = open_page_local_xfer(xfer, fd_type, img_id, opts.compress_mode != COMPRESS_OFF);
+	if (ret)
+		return ret;
+
+	/*
+	 * Direct mode, local non-streaming dump: set O_DIRECT on the pages
+	 * image fd so write_pages_loc() splices with direct I/O. Keep
+	 * compressed pages buffered because compressed blocks are
+	 * variable-length and not guaranteed to satisfy O_DIRECT alignment.
+	 * splice() honors O_DIRECT on filesystems that support it and falls
+	 * back to buffered I/O otherwise; if fcntl() fails the fd stays
+	 * buffered.
+	 */
+	if (opts.image_io_mode == IMAGE_IO_DIRECT && !opts.stream && !opts.compress_mode)
+		xfer->pi_use_direct = (set_o_direct(img_raw_fd(xfer->pi)) == 0);
+
+	return 0;
 }
 
 static int page_xfer_dump_hole(struct page_xfer *xfer, struct iovec *hole, u32 flags)
@@ -855,6 +1401,7 @@ int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *p
 			pr_debug("\t p %p - %p\n", iov.iov_base, iov.iov_base + iov.iov_len);
 
 			flags = ppb_xfer_flags(xfer, ppb);
+			xfer->force_raw = ppb->flags & PPB_FORCE_RAW;
 
 			if (xfer->write_pagemap(xfer, &iov, flags))
 				goto err;
@@ -903,6 +1450,7 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			pr_debug("\tp %p - %p\n", iov.iov_base, iov.iov_base + iov.iov_len);
 
 			flags = ppb_xfer_flags(xfer, ppb);
+			xfer->force_raw = ppb->flags & PPB_FORCE_RAW;
 
 			if (xfer->write_pagemap(xfer, &iov, flags))
 				return -1;
@@ -1009,21 +1557,24 @@ struct page_xfer_job {
 
 static struct page_xfer_job cxfer = {
 	.dst_id = ~0,
+	.p = { -1, -1 },
 };
 
 static struct pipe_read_dest pipe_read_dest = {
+	.p = { -1, -1 },
 	.sink_fd = -1,
 };
 
 static void page_server_close(void)
 {
-	if (cxfer.dst_id != ~0)
+	if (cxfer.dst_id != ~0ULL) {
+		/* Make repeated/error-path cleanup harmless before closing resources. */
+		cxfer.dst_id = ~0ULL;
 		cxfer.loc_xfer.close(&cxfer.loc_xfer);
-	if (pipe_read_dest.sink_fd != -1) {
-		close(pipe_read_dest.sink_fd);
-		close(pipe_read_dest.p[0]);
-		close(pipe_read_dest.p[1]);
 	}
+	close_safe(&pipe_read_dest.sink_fd);
+	close_safe(&pipe_read_dest.p[0]);
+	close_safe(&pipe_read_dest.p[1]);
 }
 
 static int page_server_open(int sk, struct page_server_iov *pi)
@@ -1041,7 +1592,13 @@ static int page_server_open(int sk, struct page_server_iov *pi)
 
 	page_server_close();
 
-	if (open_page_local_xfer(&cxfer.loc_xfer, type, id))
+	/*
+	 * The wire command, rather than the page-server's local options,
+	 * determines how the payload is stored. PS_IOV_ADD_F uses the ordinary
+	 * callbacks selected here; PS_IOV_ADD_F_COMPRESSED is handled directly
+	 * by page_server_add_compressed().
+	 */
+	if (open_page_local_xfer(&cxfer.loc_xfer, type, id, false))
 		return -1;
 
 	cxfer.dst_id = pi->dst_id;
@@ -1050,7 +1607,7 @@ static int page_server_open(int sk, struct page_server_iov *pi)
 		char has_parent = !!cxfer.loc_xfer.parent;
 		if (__send(sk, &has_parent, 1, 0) != 1) {
 			pr_perror("Unable to send response");
-			close_page_xfer(&cxfer.loc_xfer);
+			page_server_close();
 			return -1;
 		}
 	}
@@ -1067,12 +1624,157 @@ static int prep_loc_xfer(struct page_server_iov *pi)
 		return 0;
 }
 
+static int validate_page_server_iov(struct page_server_iov *pi, u32 flags)
+{
+	const u32 wire_flags = PE_PARENT | PE_LAZY | PE_PRESENT;
+
+	/* PE_PAYLOAD_ALIGNED describes local image layout, never wire data. */
+	if (flags & ~wire_flags) {
+		pr_err("Invalid page-server flags %#x\n", flags);
+		return -1;
+	}
+	/* A lazy-only entry intentionally has no local payload. Nothing does not. */
+	if (!(flags & wire_flags)) {
+		pr_err("Page-server entry has no storage or lazy state\n");
+		return -1;
+	}
+	if ((flags & (PE_PRESENT | PE_PARENT)) == (PE_PRESENT | PE_PARENT)) {
+		pr_err("Page-server entry cannot be present and inherited\n");
+		return -1;
+	}
+	if (!pi->nr_pages || (pi->vaddr & (PAGE_SIZE - 1)) ||
+	    pi->vaddr > ULONG_MAX || pi->nr_pages > SIZE_MAX / PAGE_SIZE ||
+	    pi->nr_pages > (ULONG_MAX - (unsigned long)pi->vaddr) / PAGE_SIZE) {
+		pr_err("Invalid page-server range %#" PRIx64 "+%" PRIu64 " pages\n", pi->vaddr, pi->nr_pages);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Receive pre-compressed pages from the network. The client sends
+ * a uint32_t compressed_size followed by compressed_size bytes of
+ * data for each page. Zero pages have compressed_size=0 with no
+ * data. Pages stored raw have compressed_size=PAGE_SIZE.
+ *
+ * We write them directly to the local image without re-compressing.
+ */
+static int page_server_add_compressed(int sk, struct page_server_iov *pi, u32 flags)
+{
+	struct page_xfer *lxfer = &cxfer.loc_xfer;
+	struct iovec iov;
+	unsigned long i;
+	uint32_t *compressed_size;
+	uint64_t total_compressed_size = 0;
+	bool all_raw = true;
+	bool payload_started = false;
+
+	if (validate_page_server_iov(pi, flags))
+		return -1;
+	pr_debug("Adding compressed %" PRIx64 " - %" PRIx64 "\n", pi->vaddr, pi->vaddr + pi->nr_pages * PAGE_SIZE);
+
+	if (prep_loc_xfer(pi))
+		return -1;
+
+	psi2iovec(pi, &iov);
+
+	if (!(flags & PE_PRESENT)) {
+		/* Non-present pages: write pagemap immediately */
+		if (write_pagemap_loc(lxfer, &iov, flags))
+			return -1;
+		return 0;
+	}
+
+	if (opts.auto_dedup && lxfer->parent != NULL) {
+		int ret = dedup_one_iovec(lxfer->parent, encode_pointer(iov.iov_base), iov.iov_len);
+
+		if (ret == -1) {
+			pr_err("Auto-deduplication failed\n");
+			return -1;
+		}
+	}
+
+	compressed_size = xmalloc(pi->nr_pages * sizeof(uint32_t));
+	if (!compressed_size)
+		return -1;
+
+	/* Receive per-page compressed data from the network */
+	for (i = 0; i < pi->nr_pages; i++) {
+		uint32_t cs;
+
+		if (recv_full(sk, &cs, sizeof(cs), "compressed size")) {
+			xfree(compressed_size);
+			return -1;
+		}
+
+		if (cs > PAGE_SIZE) {
+			pr_err("Invalid compressed size %u from network\n", cs);
+			xfree(compressed_size);
+			return -1;
+		}
+
+		compressed_size[i] = cs;
+		total_compressed_size += cs;
+		if (cs != PAGE_SIZE)
+			all_raw = false;
+
+		if (cs > 0) {
+			char buf[PAGE_COMPRESSED_SIZE_BOUND];
+
+			if (!payload_started) {
+				payload_started = true;
+				if (cs == PAGE_SIZE && align_pages_image_payload(lxfer, &flags)) {
+					xfree(compressed_size);
+					return -1;
+				}
+			}
+			if (recv_full(sk, buf, cs, "compressed data")) {
+				xfree(compressed_size);
+				return -1;
+			}
+
+			if (write_pages_image_data(lxfer, buf, cs)) {
+				xfree(compressed_size);
+				return -1;
+			}
+		}
+	}
+
+	/* Write pagemap entry with compression metadata */
+	{
+		PagemapEntry pe = PAGEMAP_ENTRY__INIT;
+
+		pe.vaddr = encode_pointer(iov.iov_base);
+		pe.nr_pages = pi->nr_pages;
+		pe.has_flags = true;
+		pe.flags = flags;
+		pe.has_nr_pages = true;
+		if (!all_raw) {
+			pe.compressed_size = compressed_size;
+			pe.n_compressed_size = pi->nr_pages;
+			pe.has_total_compressed_size = true;
+			pe.total_compressed_size = total_compressed_size;
+		}
+
+		if (pb_write_one(lxfer->pmi, &pe, PB_PAGEMAP) < 0) {
+			xfree(compressed_size);
+			return -1;
+		}
+	}
+
+	xfree(compressed_size);
+	return 0;
+}
+
 static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 {
 	size_t len;
 	struct page_xfer *lxfer = &cxfer.loc_xfer;
 	struct iovec iov;
 
+	if (validate_page_server_iov(pi, flags))
+		return -1;
 	pr_debug("Adding %" PRIx64 " - %" PRIx64 "\n",
 		 pi->vaddr, pi->vaddr + pi->nr_pages * PAGE_SIZE);
 
@@ -1080,7 +1782,8 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 		return -1;
 
 	psi2iovec(pi, &iov);
-	if (lxfer->write_pagemap(lxfer, &iov, flags))
+	/* PS_IOV_ADD_F always carries an ordinary, uncompressed payload. */
+	if (write_pagemap_loc(lxfer, &iov, flags))
 		return -1;
 
 	if (!(flags & PE_PRESENT))
@@ -1126,7 +1829,7 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 			}
 		}
 
-		if (lxfer->write_pages(lxfer, cxfer.p[0], chunk))
+		if (write_pages_loc(lxfer, cxfer.p[0], chunk))
 			return -1;
 
 		len -= chunk;
@@ -1187,6 +1890,7 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 static int page_server_serve(int sk)
 {
 	int ret = -1;
+	int pipe_size;
 	bool flushed = false;
 	bool receiving_pages = !opts.lazy_pages;
 
@@ -1204,10 +1908,22 @@ static int page_server_serve(int sk)
 			return -1;
 		}
 
-		cxfer.pipe_size = fcntl(cxfer.p[0], F_GETPIPE_SZ, 0);
+		pipe_size = fcntl(cxfer.p[0], F_GETPIPE_SZ, 0);
+		if (pipe_size < 0) {
+			pr_perror("Can't get page-server transfer pipe size");
+			close_safe(&cxfer.p[0]);
+			close_safe(&cxfer.p[1]);
+			close(sk);
+			return -1;
+		}
+		cxfer.pipe_size = pipe_size;
 		pr_debug("Created xfer pipe size %u\n", cxfer.pipe_size);
 	} else {
-		pipe_read_dest_init(&pipe_read_dest);
+		if (pipe_read_dest_init(&pipe_read_dest)) {
+			page_server_close();
+			close(sk);
+			return -1;
+		}
 		tcp_cork(sk, true);
 	}
 
@@ -1238,6 +1954,12 @@ static int page_server_serve(int sk)
 		case PS_IOV_PARENT:
 			ret = page_server_check_parent(sk, &pi);
 			break;
+		case PS_IOV_ADD_F_COMPRESSED: {
+			u32 flags = decode_ps_flags(pi.cmd);
+
+			ret = page_server_add_compressed(sk, &pi, flags);
+			break;
+		}
 		case PS_IOV_ADD_F:
 		case PS_IOV_ADD:
 		case PS_IOV_HOLE: {
@@ -1307,6 +2029,10 @@ static int page_server_serve(int sk)
 	}
 
 	page_server_close();
+	if (receiving_pages) {
+		close_safe(&cxfer.p[0]);
+		close_safe(&cxfer.p[1]);
+	}
 
 	pr_info("Session over\n");
 
@@ -1314,10 +2040,152 @@ static int page_server_serve(int sk)
 	return ret;
 }
 
-static int fill_page_pipe(struct page_read *pr, struct page_pipe *pp)
+/* Match the restore batch cap; individual reads are aligned below. */
+#define PAGE_SERVER_DECODE_BUFFER_SIZE (32UL << 20)
+
+static bool page_read_requires_buffered_copy(const struct page_read *pr)
+{
+	int i;
+
+	/* splice(2) is not portable for O_DIRECT input descriptors. */
+	if (pr->use_direct)
+		return true;
+
+	for (i = 0; i < pr->nr_pmes; i++)
+		if (pagemap_present(pr->pmes[i]) &&
+		    (pr->pmes[i]->n_compressed_size ||
+		     pagemap_payload_aligned(pr->pmes[i])))
+			return true;
+
+	return false;
+}
+
+static int splice_page_pipe(struct page_read *pr, struct page_pipe *pp)
 {
 	struct page_pipe_buf *ppb;
+	int fd = img_raw_fd(pr->pi);
+	int i;
+
+	if (fd < 0) {
+		pr_err("Failed getting pages image fd\n");
+		return -1;
+	}
+
+	list_for_each_entry(ppb, &pp->bufs, l) {
+		for (i = 0; i < ppb->nr_segs; i++) {
+			size_t left = ppb->iov[i].iov_len;
+
+			while (left) {
+				ssize_t ret = splice(fd, NULL, ppb->p[1], NULL, left, SPLICE_F_MOVE);
+
+				if (ret < 0) {
+					if (errno == EINTR)
+						continue;
+					pr_perror("Splice from pages image failed");
+					return -1;
+				}
+				if (!ret) {
+					pr_err("Pages image ended while filling page pipe\n");
+					return -1;
+				}
+				left -= ret;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int decode_page_pipe(struct page_read *pr, struct page_pipe *pp)
+{
+	const size_t buffer_size = max((size_t)PAGE_SIZE, (size_t)PAGE_SERVER_DECODE_BUFFER_SIZE);
+	const unsigned long buffer_pages = buffer_size / PAGE_SIZE;
+	struct page_pipe_buf *ppb;
+	void *buf = NULL;
 	int i, ret;
+
+	ret = posix_memalign(&buf, PAGE_SIZE, buffer_size);
+	if (ret) {
+		pr_err("Failed to allocate page-pipe decode buffer: %s\n", strerror(ret));
+		return -1;
+	}
+
+	pr->reset(pr);
+	list_for_each_entry(ppb, &pp->bufs, l) {
+		for (i = 0; i < ppb->nr_segs; i++) {
+			struct iovec iov = ppb->iov[i];
+			unsigned long vaddr = encode_pointer(iov.iov_base);
+			unsigned long nr_pages = iov.iov_len / PAGE_SIZE;
+			unsigned long pages_done = 0;
+
+			if (iov.iov_len % PAGE_SIZE) {
+				pr_err("Unaligned page-pipe iovec length %zu\n", iov.iov_len);
+				goto err;
+			}
+
+			while (pages_done < nr_pages) {
+				unsigned int region_pages;
+				unsigned long entry_pages;
+				unsigned long read_pages;
+				unsigned long page_vaddr = vaddr + pages_done * PAGE_SIZE;
+
+				ret = pr->seek_pagemap(pr, page_vaddr);
+				if (ret <= 0 || !pr->pe || pagemap_in_parent(pr->pe)) {
+					pr_err("Missing local page at %#lx while filling page pipe\n", page_vaddr);
+					goto err;
+				}
+
+				entry_pages = pr->pe->nr_pages - ((page_vaddr - pr->pe->vaddr) / PAGE_SIZE);
+				read_pages = entry_pages;
+				read_pages = min(read_pages, nr_pages - pages_done);
+				region_pages = pr->pe->has_region_pages ? pr->pe->region_pages : 0;
+				if (read_pages > buffer_pages ||
+				    (region_pages && read_pages == buffer_pages &&
+				     entry_pages > read_pages)) {
+					unsigned long batch_pages = buffer_pages;
+
+					/*
+					 * Region sizes are arbitrary page multiples, so a fixed
+					 * 32 MiB buffer is not divisible by all of them.  End a
+					 * bounded chunk on a region boundary; otherwise the next
+					 * chunk falls back to synchronous partial decompression.
+					 */
+					if (region_pages)
+						batch_pages -= batch_pages % region_pages;
+					if (!batch_pages) {
+						pr_err("Compression region %u exceeds page-server decode buffer\n",
+						       region_pages);
+						goto err;
+					}
+					read_pages = batch_pages;
+				}
+				ret = pr->read_pages(pr, page_vaddr, read_pages, buf, PR_ASYNC);
+				if (ret < 0)
+					goto err;
+				if (pr->sync(pr))
+					goto err;
+
+				if (write_fd_full(ppb->p[1], buf, read_pages * PAGE_SIZE)) {
+					pr_err("Failed writing decoded pages to page pipe\n");
+					goto err;
+				}
+				pages_done += read_pages;
+			}
+		}
+	}
+
+	xfree(buf);
+	return 0;
+
+err:
+	xfree(buf);
+	return -1;
+}
+
+static int fill_page_pipe(struct page_read *pr, struct page_pipe *pp)
+{
+	unsigned long i;
+	int ret;
 
 	pr->reset(pr);
 
@@ -1336,17 +2204,17 @@ static int fill_page_pipe(struct page_read *pr, struct page_pipe *pp)
 		}
 	}
 
-	list_for_each_entry(ppb, &pp->bufs, l) {
-		for (i = 0; i < ppb->nr_segs; i++) {
-			struct iovec iov = ppb->iov[i];
-
-			if (splice(img_raw_fd(pr->pi), NULL, ppb->p[1], NULL, iov.iov_len, SPLICE_F_MOVE) !=
-			    iov.iov_len) {
-				pr_perror("Splice failed");
-				return -1;
-			}
-		}
-	}
+	/*
+	 * Ordinary page images retain the original zero-copy send path. A page
+	 * image with compression metadata needs the page reader to synthesize
+	 * zero blocks, copy raw fallbacks, and decode LZ4 blocks.
+	 */
+	if (page_read_requires_buffered_copy(pr))
+		ret = decode_page_pipe(pr, pp);
+	else
+		ret = splice_page_pipe(pr, pp);
+	if (ret)
+		return ret;
 
 	debug_show_page_pipe(pp);
 
@@ -1363,6 +2231,8 @@ static int page_pipe_from_pagemap(struct page_pipe **pp, int pid)
 		pr_err("Failed to open page read for %d\n", pid);
 		return -1;
 	}
+	/* Building the serving pipe must not modify the source image on failure. */
+	page_read_disable_dedup(&pr);
 
 	while (pr.advance(&pr))
 		if (pagemap_present(pr.pe))

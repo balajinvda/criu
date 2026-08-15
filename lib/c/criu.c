@@ -376,6 +376,85 @@ void criu_set_track_mem(bool track_mem)
 	criu_local_set_track_mem(global_opts, track_mem);
 }
 
+int criu_local_set_compress(criu_opts *opts, enum criu_compress_mode mode)
+{
+	if (mode < CRIU_COMPRESS_OFF || mode > CRIU_COMPRESS_REGION)
+		return -EINVAL;
+
+	opts->rpc->has_compress = true;
+	opts->rpc->compress = mode;
+	if (mode != CRIU_COMPRESS_REGION) {
+		opts->rpc->has_compress_region_size = false;
+		opts->rpc->compress_region_size = 0;
+	}
+	if (mode == CRIU_COMPRESS_OFF) {
+		opts->rpc->has_compress_acceleration = false;
+		opts->rpc->compress_acceleration = 0;
+	}
+	return 0;
+}
+
+int criu_set_compress(enum criu_compress_mode mode)
+{
+	return criu_local_set_compress(global_opts, mode);
+}
+
+int criu_local_set_compress_acceleration(criu_opts *opts,
+					 unsigned int acceleration)
+{
+	if (acceleration < 1 || acceleration > CRIU_COMPRESS_MAX_ACCELERATION)
+		return -EINVAL;
+
+	opts->rpc->has_compress_acceleration = true;
+	opts->rpc->compress_acceleration = acceleration;
+	if (!opts->rpc->has_compress ||
+	    opts->rpc->compress == CRIU_COMPRESS_OFF) {
+		opts->rpc->has_compress = true;
+		opts->rpc->compress = CRIU_COMPRESS_PER_PAGE;
+	}
+	return 0;
+}
+
+int criu_set_compress_acceleration(unsigned int acceleration)
+{
+	return criu_local_set_compress_acceleration(global_opts, acceleration);
+}
+
+int criu_local_set_compress_region_size(criu_opts *opts, unsigned int bytes)
+{
+	long page_size = sysconf(_SC_PAGESIZE);
+
+	if (page_size <= 0 || !bytes || bytes > CRIU_COMPRESS_MAX_REGION_SIZE ||
+	    bytes % (unsigned long)page_size)
+		return -EINVAL;
+
+	opts->rpc->has_compress_region_size = true;
+	opts->rpc->compress_region_size = bytes;
+	opts->rpc->has_compress = true;
+	opts->rpc->compress = CRIU_COMPRESS_REGION;
+	return 0;
+}
+
+int criu_set_compress_region_size(unsigned int bytes)
+{
+	return criu_local_set_compress_region_size(global_opts, bytes);
+}
+
+int criu_local_set_decompress_threads(criu_opts *opts, unsigned int threads)
+{
+	if (threads > CRIU_DECOMPRESS_MAX_THREADS)
+		return -EINVAL;
+
+	opts->rpc->has_decompress_threads = true;
+	opts->rpc->decompress_threads = threads;
+	return 0;
+}
+
+int criu_set_decompress_threads(unsigned int threads)
+{
+	return criu_local_set_decompress_threads(global_opts, threads);
+}
+
 void criu_local_set_auto_dedup(criu_opts *opts, bool auto_dedup)
 {
 	opts->rpc->has_auto_dedup = true;
@@ -498,6 +577,21 @@ void criu_local_set_tcp_established(criu_opts *opts, bool tcp_established)
 void criu_set_tcp_established(bool tcp_established)
 {
 	criu_local_set_tcp_established(global_opts, tcp_established);
+}
+
+int criu_local_set_image_io_mode(criu_opts *opts, enum criu_image_io_mode mode)
+{
+	if (mode == CRIU_IMAGE_IO_WRITEBACK || mode == CRIU_IMAGE_IO_DIRECT) {
+		opts->rpc->has_image_io_mode = true;
+		opts->rpc->image_io_mode = (CriuImageIoMode)mode;
+		return 0;
+	}
+	return -1;
+}
+
+int criu_set_image_io_mode(enum criu_image_io_mode mode)
+{
+	return criu_local_set_image_io_mode(global_opts, mode);
 }
 
 void criu_local_set_tcp_skip_in_flight(criu_opts *opts, bool tcp_skip_in_flight)
@@ -1992,6 +2086,10 @@ int criu_local_feature_check(criu_opts *opts, struct criu_feature_check *feature
 		criu_features.has_pidfd_store = true;
 		criu_features.pidfd_store = true;
 	}
+	if (features_copy.mem_compression) {
+		criu_features.has_mem_compression = true;
+		criu_features.mem_compression = true;
+	}
 	req.features = &criu_features;
 
 	ret = send_req_and_recv_resp(opts, &req, &resp);
@@ -2009,6 +2107,9 @@ int criu_local_feature_check(criu_opts *opts, struct criu_feature_check *feature
 		}
 		if (resp->features->has_pidfd_store) {
 			features_copy.pidfd_store = resp->features->pidfd_store;
+		}
+		if (resp->features->has_mem_compression) {
+			features_copy.mem_compression = resp->features->mem_compression;
 		}
 		memcpy(features, &features_copy, size);
 	} else {

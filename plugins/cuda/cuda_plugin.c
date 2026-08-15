@@ -25,6 +25,9 @@
 #define ACTION_CHECKPOINT "checkpoint"
 #define ACTION_RESTORE	  "restore"
 #define ACTION_UNLOCK	  "unlock"
+/* "resume" = restore then unlock in a single cuda-checkpoint invocation, so the
+ * ~2.7s cuInit driver-attach is paid once instead of once per action. */
+#define ACTION_RESUME	  "resume"
 
 typedef enum {
 	CUDA_TASK_RUNNING = 0,
@@ -471,6 +474,20 @@ unlock:
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__PAUSE_DEVICES, cuda_plugin_pause_devices)
 
+/* The combined "resume" action (restore + unlock in one cuda-checkpoint spawn)
+ * is an extension not present in every cuda-checkpoint build. Feature-detect it
+ * once and fall back to separate restore + unlock when it is unavailable, so
+ * the plugin stays correct against a stock cuda-checkpoint. */
+static int cuda_checkpoint_supports_resume(void)
+{
+	static int supported = -1;
+
+	if (supported == -1)
+		supported = (cuda_checkpoint_supports_flag(ACTION_RESUME) == 1);
+
+	return supported;
+}
+
 int resume_device(int pid, int checkpointed, cuda_task_state_t initial_task_state)
 {
 	char msg_buf[CUDA_CKPT_BUF_SIZE];
@@ -503,22 +520,37 @@ int resume_device(int pid, int checkpointed, cuda_task_state_t initial_task_stat
 		return -1;
 	}
 
-	if (checkpointed && (initial_task_state == CUDA_TASK_RUNNING || initial_task_state == CUDA_TASK_LOCKED)) {
-		/* If the process was "locked" or "running" before checkpointing it, we need to restore it */
-		status = cuda_process_checkpoint_action(pid, ACTION_RESTORE, 0, msg_buf, sizeof(msg_buf));
+	/* A process that was "running" at checkpoint needs restore + unlock; one
+	 * that was "locked" needs restore only. Each cuda-checkpoint spawn pays a
+	 * ~2.7s cuInit driver-attach, so when both restore and unlock apply (the
+	 * common `criu restore` path) and cuda-checkpoint supports it, do them in a
+	 * single "resume" invocation to pay cuInit once instead of twice. Same
+	 * driver actions, same order. Otherwise fall back to restore then unlock. */
+	int need_restore = checkpointed && (initial_task_state == CUDA_TASK_RUNNING || initial_task_state == CUDA_TASK_LOCKED);
+	int need_unlock = (initial_task_state == CUDA_TASK_RUNNING);
+
+	if (need_restore && need_unlock && cuda_checkpoint_supports_resume()) {
+		status = cuda_process_checkpoint_action(pid, ACTION_RESUME, 0, msg_buf, sizeof(msg_buf));
 		if (status) {
-			pr_err("RESUME_DEVICES RESTORE failed with %s\n", msg_buf);
+			pr_err("RESUME_DEVICES RESUME failed with %s\n", msg_buf);
 			ret = -1;
 			goto interrupt;
 		}
-	}
-
-	if (initial_task_state == CUDA_TASK_RUNNING) {
-		/* If the process was "running" before we paused it, we need to unlock it */
-		status = cuda_process_checkpoint_action(pid, ACTION_UNLOCK, 0, msg_buf, sizeof(msg_buf));
-		if (status) {
-			pr_err("RESUME_DEVICES UNLOCK failed with %s\n", msg_buf);
-			ret = -1;
+	} else {
+		if (need_restore) {
+			status = cuda_process_checkpoint_action(pid, ACTION_RESTORE, 0, msg_buf, sizeof(msg_buf));
+			if (status) {
+				pr_err("RESUME_DEVICES RESTORE failed with %s\n", msg_buf);
+				ret = -1;
+				goto interrupt;
+			}
+		}
+		if (need_unlock) {
+			status = cuda_process_checkpoint_action(pid, ACTION_UNLOCK, 0, msg_buf, sizeof(msg_buf));
+			if (status) {
+				pr_err("RESUME_DEVICES UNLOCK failed with %s\n", msg_buf);
+				ret = -1;
+			}
 		}
 	}
 

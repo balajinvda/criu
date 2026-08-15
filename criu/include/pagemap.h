@@ -1,6 +1,9 @@
 #ifndef __CR_PAGE_READ_H__
 #define __CR_PAGE_READ_H__
 
+#include <stddef.h>
+#include <sys/types.h>
+
 #include "common/list.h"
 #include "images/pagemap.pb-c.h"
 #include "page.h"
@@ -42,20 +45,37 @@
  * All this is implemented in read_pagemap_page.
  */
 
+struct encoded_read_ctx;
+
 struct page_read {
 	/* reads page from current pagemap */
 	int (*read_pages)(struct page_read *, unsigned long vaddr, unsigned long nr, void *, unsigned flags);
+
 	/* Advance page_read to the next entry */
 	int (*advance)(struct page_read *pr);
+
+	/* Close all images: pagemap, pages (both local & parent) */
 	void (*close)(struct page_read *);
+
+	/* Advance virtual and pages-image cursors without copying data */
 	void (*skip_pages)(struct page_read *, unsigned long len);
+
+	/* Process and drain queued asynchronous page reads */
 	int (*sync)(struct page_read *pr);
+
+	/* Reposition read file offset for specific vaddr */
 	int (*seek_pagemap)(struct page_read *pr, unsigned long vaddr);
+
+	/* Reset read cursors and current entries, including parent readers */
 	void (*reset)(struct page_read *pr);
+
+	/* Used only for lazy restore (= uffd_io_complete) */
 	int (*io_complete)(struct page_read *, unsigned long vaddr, unsigned long nr);
+
+	/* Read from the selected remote, streamed, or local backing image */
 	int (*maybe_read_page)(struct page_read *pr, unsigned long vaddr, unsigned long nr, void *buf, unsigned flags);
 
-	/* Whether or not pages can be read in PIE code */
+	/* Whether or not pages can be read in PIE code (restorer context) */
 	bool pieok;
 
 	/* Whether or not disable image deduplication*/
@@ -71,15 +91,62 @@ struct page_read {
 	struct cr_img *pi;
 	u32 pages_img_id;
 
-	PagemapEntry *pe;	  /* current pagemap we are on */
-	struct page_read *parent; /* parent pagemap (if ->in_parent pagemap is met in image,
-				   * then go to this guy for page, see read_pagemap_page */
-	unsigned long cvaddr;	  /* vaddr we are on */
-	off_t pi_off;		  /* current offset in pages file */
+	/* Current pagemap we are on */
+	PagemapEntry *pe;
 
-	struct iovec bunch;   /* record consequent neighbour iovecs to punch together */
-	unsigned id;	      /* for logging */
-	unsigned long img_id; /* pagemap image file ID */
+	/* Parent pagemap (if ->in_parent pagemap is met in image,
+	 * then go to this guy for page, see read_pagemap_page) */
+	struct page_read *parent;
+
+	/* Current virtual address we are on */
+	unsigned long cvaddr;
+
+	/* Current offset in pages file */
+	off_t pi_off;
+	/* Alignment bytes a sequential image-streamer reader must discard. */
+	size_t stream_padding;
+
+	/*
+	 * Index into pe->compressed_size[] for the current pagemap
+	 * entry. Tracks which compressed block (page in per-page mode,
+	 * region in region mode) we are on when reading or skipping
+	 * compressed pages. Reset to 0 on advance().
+	 */
+	size_t compressed_size_index;
+
+	/*
+	 * In region mode: pages already consumed (read or skipped) from
+	 * the current block. Always 0 in per-page mode. Reset to 0 on
+	 * advance() and whenever the reader crosses a block boundary.
+	 */
+	unsigned int region_block_offset;
+
+	/*
+	 * Last decompressed region block for repeated partial reads. A page
+	 * reader belongs to one pages image, so its virtual address and size
+	 * uniquely identify the cached block. A zero size means no valid cache.
+	 */
+	char *cached_region;
+	unsigned long cached_region_vaddr;
+	size_t cached_region_size;
+
+	/*
+	 * Bounded encoded buffers and workers. All readers in an incremental
+	 * parent chain use the context owned by encoded_read_owner, so a sync
+	 * initiated by a parent cannot acquire a second batch lease and deadlock
+	 * against its child. Only the owner releases the context at close.
+	 */
+	struct encoded_read_ctx *encoded_read_ctx;
+	struct page_read *encoded_read_owner;
+
+	/* Record consequent neighbour iov-ecs to punch together */
+	struct iovec bunch;
+
+	/* For logging */
+	unsigned id;
+
+	/* Pagemap image file ID */
+	unsigned long img_id;
 
 	PagemapEntry **pmes;
 	int nr_pmes;
@@ -114,6 +181,35 @@ int pagemap_enqueue_iovec(struct page_read *pr, void *buf, unsigned long len, st
 int pagemap_render_iovec(struct list_head *from, struct task_restore_args *ta);
 
 /*
+ * Return true when every file-backed queued read can be submitted with
+ * O_DIRECT. Encoded storage is rejected; raw storage and all destination
+ * extents must be page-aligned. Zero entries have no file extent, and a
+ * zero-only list returns false because it needs no AIO setup.
+ */
+bool pagemap_iovec_is_direct_compatible(const struct list_head *from);
+
+/*
+ * Return whether any page-image block overlapping [start, end) contains an
+ * actual LZ4 payload. Raw-fallback and zero blocks return false. Parent-image
+ * entries are followed without changing either reader's cursor.
+ *
+ * A local lookup is O(log(nr_pmes) + overlapping entries/blocks). Each
+ * inherited span repeats that lookup in the parent, so a fragmented parent
+ * chain additionally pays one logarithmic lookup per inherited span. A
+ * negative return indicates invalid input or an inconsistent parent chain.
+ */
+int page_read_range_has_lz4(struct page_read *pr, unsigned long start,
+			     unsigned long end);
+
+/* Also return true when raw/zero runs exceed the bounded direct-PIE limit. */
+int page_read_range_needs_premap(struct page_read *pr, unsigned long start,
+				  unsigned long end);
+
+/* Return whether the top image delegates any part of [start, end) to a parent. */
+int page_read_range_has_parent(struct page_read *pr, unsigned long start,
+				unsigned long end);
+
+/*
  * Try to enable O_DIRECT on a pages-image fd and verify with one
  * aligned probe read.
  *
@@ -133,6 +229,7 @@ int probe_pages_o_direct(int fd);
  * maintains its own set of references to those structures.
  */
 extern void dup_page_read(struct page_read *src, struct page_read *dst);
+extern void page_read_free_cache(struct page_read *pr);
 
 extern void page_read_disable_dedup(struct page_read *pr);
 
@@ -152,6 +249,7 @@ static inline bool page_read_has_parent(struct page_read *pr)
 #define PE_PARENT  (1 << 0) /* pages are in parent snapshot */
 #define PE_LAZY	   (1 << 1) /* pages can be lazily restored */
 #define PE_PRESENT (1 << 2) /* pages are present in pages*img */
+#define PE_PAYLOAD_ALIGNED (1 << 3) /* payload starts at a page boundary */
 
 static inline bool pagemap_in_parent(PagemapEntry *pe)
 {
@@ -166,6 +264,19 @@ static inline bool pagemap_lazy(PagemapEntry *pe)
 static inline bool pagemap_present(PagemapEntry *pe)
 {
 	return !!(pe->flags & PE_PRESENT);
+}
+
+static inline bool pagemap_payload_aligned(PagemapEntry *pe)
+{
+	return !!(pe->flags & PE_PAYLOAD_ALIGNED);
+}
+
+/* Keep the mask as wide as off_t so offsets above 4 GiB remain intact. */
+static inline off_t pagemap_page_align_offset(off_t offset)
+{
+	off_t mask = ~((off_t)PAGE_SIZE - 1);
+
+	return (offset + (off_t)PAGE_SIZE - 1) & mask;
 }
 
 #endif /* __CR_PAGE_READ_H__ */

@@ -104,6 +104,16 @@ enum FILE_VALIDATION_OPTIONS {
 /* This constant dictates which file validation method should be tried by default. */
 #define FILE_VALIDATION_DEFAULT FILE_VALIDATION_BUILD_ID
 
+enum IMAGE_IO_MODE {
+	/* Buffered I/O for the pages image; the host page cache is used. */
+	IMAGE_IO_WRITEBACK = 0,
+	/* O_DIRECT for the pages image; the host page cache is bypassed. */
+	IMAGE_IO_DIRECT
+};
+
+/* This constant dictates which I/O mode is used for the pages image by default. */
+#define IMAGE_IO_DEFAULT IMAGE_IO_WRITEBACK
+
 /* This constant dictates that criu use fiemap to copy ghost file by default.*/
 #define FIEMAP_DEFAULT 1
 
@@ -218,8 +228,47 @@ struct cr_options {
 	int tls;
 	int tls_no_cn_verify;
 
+	/*
+	 * Memory page compression mode (enum compress_mode):
+	 *   COMPRESS_OFF       (0) = no compression (default)
+	 *   COMPRESS_PER_PAGE  (1) = each system page is its own LZ4 block
+	 *   COMPRESS_REGION    (2) = regions of compress_region_size bytes
+	 *                            are compressed as one LZ4 block
+	 *
+	 * Predicate "is compression on?" is just `if (opts.compress_mode)`.
+	 */
+	int compress_mode;
+
+	/*
+	 * LZ4 acceleration level for page compression.
+	 * Internal: 0 means the user did not set a value (default acceleration).
+	 * CLI/RPC accept 1..LZ4_MAX_ACCELERATION (higher = faster, lower ratio).
+	 */
+	unsigned int compress_acceleration;
+
+	/*
+	 * Region size in bytes when compress_mode == COMPRESS_REGION.
+	 * Must be a multiple of PAGE_SIZE and <= MAX_REGION_SIZE.
+	 * 0 means "use default".
+	 */
+	unsigned int compress_region_size;
+
+	/*
+	 * Worker concurrency for LZ4 decoding and eligible large zero fills,
+	 * including the calling thread. 0 selects automatic concurrency; 1, the
+	 * default, keeps LZ4 decoding serial and disables zero-fill workers; values
+	 * above 1 limit aggregate worker concurrency.
+	 * Independent requests may still run concurrently. Active concurrency is
+	 * bounded by available CPUs, useful batch work, and the restore-wide CPU
+	 * budget.
+	 */
+	unsigned int decompress_threads;
+
 	/* This stores which method to use for file validation. */
 	int file_validation_method;
+
+	/* This stores the I/O mode (writeback/direct) for the pages image. */
+	int image_io_mode;
 
 	/* Shows the mode criu is running at the moment: dump/pre-dump/restore/... */
 	enum criu_mode mode;
