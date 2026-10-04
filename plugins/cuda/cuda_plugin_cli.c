@@ -31,6 +31,14 @@
 #define ACTION_CHECKPOINT "checkpoint"
 #define ACTION_RESTORE	  "restore"
 #define ACTION_UNLOCK	  "unlock"
+/*
+ * "resume" restores and unlocks in one helper invocation, so the cuInit
+ * driver attach (about 2.7 s per spawn) is paid once instead of twice on the
+ * common restore path. Not every cuda-checkpoint build has it; the first
+ * attempt that the helper rejects turns it off for the rest of the run.
+ */
+#define ACTION_RESUME	  "resume"
+static bool cuda_resume_action_unsupported;
 
 typedef enum {
 	CUDA_TASK_RUNNING = 0,
@@ -751,6 +759,26 @@ static int resume_device(int pid, cuda_task_state_t current_task_state,
 	}
 	if (current_task_state == initial_task_state)
 		goto interrupt;
+
+	if (current_task_state == CUDA_TASK_CHECKPOINTED && initial_task_state == CUDA_TASK_RUNNING &&
+	    !cuda_resume_action_unsupported) {
+		/* Restore and unlock in one helper spawn; fall back below if refused. */
+		status = cuda_process_checkpoint_action(pid, ACTION_RESUME, 0,
+							device_map ? device_map->cli_value : NULL,
+							msg_buf, sizeof(msg_buf));
+		observed_task_state = get_cuda_state(pid);
+		if (observed_task_state != CUDA_TASK_UNKNOWN)
+			current_task_state = observed_task_state;
+		if (status) {
+			if (current_task_state == CUDA_TASK_CHECKPOINTED) {
+				pr_info("cuda-checkpoint has no resume action (%s); using restore then unlock\n", msg_buf);
+				cuda_resume_action_unsupported = true;
+			} else {
+				pr_warn("RESUME_DEVICES RESUME on pid %d left CUDA state %d: %s\n",
+					pid, current_task_state, msg_buf);
+			}
+		}
+	}
 
 	if (current_task_state == CUDA_TASK_CHECKPOINTED) {
 		/* If the process was "locked" or "running" before checkpointing it, we need to restore it */
