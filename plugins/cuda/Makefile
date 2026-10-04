@@ -1,6 +1,6 @@
 PLUGIN_NAME := cuda_plugin
 PLUGIN_SOBJ := cuda_plugin.so
-PLUGIN_SRCS := cuda_plugin.c cuda_plugin_driver.c cuda_plugin_cli.c cuda_wait.c cuda_device_map.c cuda.pb-c.c
+PLUGIN_SRCS := cuda_plugin.c cuda_plugin_driver.c cuda_plugin_cli.c cuda_wait.c cuda_device_map.c cuda_device_files.c cuda.pb-c.c
 PLUGIN_HEADERS := cuda_plugin.h cuda_checkpoint.h cuda_wait.h cuda_device_map.h cuda.pb-c.h
 
 DEPS_CUDA := $(PLUGIN_SOBJ)

@@ -283,10 +283,23 @@ static int cuda_plugin_pause_devices(int pid)
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__PAUSE_DEVICES, cuda_plugin_pause_devices)
 
+bool cuda_plugin_active(void)
+{
+	return active_backend != NULL;
+}
+
 static int cuda_plugin_checkpoint_devices(int pid)
 {
 	if (!active_backend)
 		return -ENOTSUP;
+
+	/*
+	 * Record the NVIDIA device fds before the checkpoint action runs: it
+	 * closes them as part of releasing the GPU, so CRIU's later fd
+	 * collection would never see them.
+	 */
+	if (cuda_device_files_record(pid))
+		pr_warn("Unable to record NVIDIA device fds of pid %d; device files may be missing at restore\n", pid);
 
 	return active_backend->checkpoint_devices(pid);
 }
@@ -399,6 +412,7 @@ error:
 
 static int cuda_plugin_dump_finish(int ret)
 {
+	cuda_device_files_dump_finish();
 	if (!active_backend)
 		return -ENOTSUP;
 

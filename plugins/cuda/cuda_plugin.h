@@ -11,6 +11,13 @@ extern unsigned int cuda_plugin_timeout;
 /* Register a CUDA task before locking it, while allocation can still fail safely. */
 int cuda_plugin_add_inventory(void);
 
+/* True once a backend has been selected; the device-file hooks stay out otherwise. */
+bool cuda_plugin_active(void);
+
+/* NVIDIA device fds and VMAs (cuda_device_files.c). */
+int cuda_device_files_record(int pid);
+void cuda_device_files_dump_finish(void);
+
 struct cuda_plugin_backend {
 	const char *name;
 	int (*probe)(bool device_map_requested);
