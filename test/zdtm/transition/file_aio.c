@@ -15,25 +15,27 @@ const char *test_author = "Andrew Vagin <avagin@parallels.com>";
 
 #define BUF_SIZE 1024
 
+char *filename;
+TEST_OPTION(filename, string, "file name", 1);
+
 int main(int argc, char **argv)
 {
-	char buf[BUF_SIZE];
-	int fd;
+	uint8_t buf[BUF_SIZE];
 	struct aiocb aiocb;
 	const struct aiocb *aioary[1];
-	char tmpfname[256] = "/tmp/file_aio.XXXXXX";
-	int ret;
+	uint32_t crc;
+	int ret, fd;
 
 	test_init(argc, argv);
 
-	fd = mkstemp(tmpfname);
-	if (fd == -1) {
-		pr_perror("mkstemp() failed");
+	fd = open(filename, O_CREAT | O_TRUNC | O_RDWR, 0600);
+	if (fd < 0) {
+		pr_perror("can't open %s", filename);
 		exit(1);
 	}
 
-	unlink(tmpfname);
-
+	crc = ~0;
+	datagen(buf, sizeof(buf), &crc);
 	if (write(fd, buf, BUF_SIZE) != BUF_SIZE) {
 		pr_perror("Error at write()");
 		exit(1);
@@ -56,10 +58,6 @@ int main(int argc, char **argv)
 			return 1;
 		}
 
-		if (ret < 0) {
-			pr_perror("aio_read failed");
-			exit(1);
-		}
 		/* Wait for request completion */
 		aioary[0] = &aiocb;
 	again:
@@ -96,8 +94,14 @@ int main(int argc, char **argv)
 			pr_perror("Error at aio_return()");
 			exit(1);
 		}
+		crc = ~0;
+		if (datachk(buf, sizeof(buf), &crc)) {
+			fail("CRC mismatch");
+			exit(1);
+		}
 	}
 	close(fd);
+	unlink(filename);
 	pass();
 	return 0;
 }

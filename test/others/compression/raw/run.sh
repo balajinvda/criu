@@ -86,7 +86,7 @@ function run_mode {
 	stop_test "$name"
 }
 
-run_mode page --compress
-run_mode region --compress-region=64K
+run_mode block-4k --compress-block=4K
+run_mode block-64k --compress-block=64K
 
 echo "Test PASSED"

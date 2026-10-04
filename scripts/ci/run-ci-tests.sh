@@ -52,10 +52,6 @@ ci_prep () {
 	# This can fail on aarch64
 	service apport stop || :
 
-	# Ubuntu has set up AppArmor in 24.04 so that it blocks use of user
-	# namespaces by unprivileged users. We need this for some of our tests.
-	sysctl kernel.apparmor_restrict_unprivileged_userns=0 || :
-
 	if [ "$CLANG" = "1" ]; then
 		# clang support
 		CC=clang
@@ -88,14 +84,15 @@ test_stream() {
 	# restorer and eventually close the page read. However, image-streamer expects the
 	# whole image to be read and the image is not reopened, sent twice. These MAP_HUGETLB
 	# test cases will result in EPIPE error at the moment.
-	# Region compression (--compress-region) is incompatible with the
+	# Multi-page block compression is incompatible with the
 	# per-page image-streamer wire format, so exclude those tests from
 	# the streamed run (they are covered by the local -a runs).
 	STREAM_TEST_EXCLUDE=(-x maps09 -x maps10
-		-x compress_pages_region00
-		-x compress_pages_region01
-		-x compress_pages_region02
-		-x compress_pages_region03)
+		-x compress_pages_block00
+		-x compress_pages_block01
+		-x compress_pages_block02
+		-x compress_pages_block03
+		-x compress_pages_block04)
 	./test/zdtm.py run --stream -p 2 --keep-going -a "${STREAM_TEST_EXCLUDE[@]}" "${ZDTM_OPTS[@]}"
 	if criu/criu check --feature compress; then
 		./test/zdtm.py run --stream --compress -t zdtm/static/maps00 -t zdtm/static/env00
@@ -103,6 +100,20 @@ test_stream() {
 	else
 		echo "Skipping streamed compression tests"
 	fi
+
+	# Streaming on top of a parent snapshot. The pre-dump iterations are
+	# left on disk, only the final dump is streamed.
+	./test/zdtm.py run --stream --pre 2 -p 2 --keep-going -a "${STREAM_TEST_EXCLUDE[@]}" "${ZDTM_OPTS[@]}"
+
+	./test/zdtm.py run -t zdtm/transition/maps007 --stream --pre 5 "${ZDTM_OPTS[@]}"
+	./test/zdtm.py run -t zdtm/transition/maps007 --stream --pre 2 --snaps "${ZDTM_OPTS[@]}"
+	./test/zdtm.py run -t zdtm/transition/maps007 --stream --pre 2 --pre-dump-mode read "${ZDTM_OPTS[@]}"
+
+	./test/zdtm.py run -t zdtm/transition/maps007 --stream --dedup "${ZDTM_OPTS[@]}"
+
+	# For the streamed dump and restore over RPC. The suite skips that case
+	# when criu-image-streamer is missing, which is every job but this one.
+	make -C test/others/rpc/ run
 }
 
 print_header() {
@@ -145,9 +156,16 @@ print_env() {
 # FIXME: workaround for the issue https://github.com/checkpoint-restore/criu/issues/1866
 modprobe -v sit || :
 
+# Load ipip up front so that every test netns gets the tunl0 fallback device.
+modprobe -v ipip || :
+
 print_env
 
 ci_prep
+
+# Ubuntu has set up AppArmor in >= 24.04 so that it blocks use of user
+# namespaces by unprivileged users. We need this for some of our tests.
+sysctl kernel.apparmor_restrict_unprivileged_userns=0 || :
 
 if [ "${CD_TO_TOP}" = "1" ]; then
 	cd ../../
@@ -189,7 +207,6 @@ ulimit -c unlimited
 cgid=$$
 cleanup_cgroup() {
 	./test/zdtm_umount_cgroups $cgid
-	dmesg
 }
 trap cleanup_cgroup EXIT
 ./test/zdtm_mount_cgroups $cgid
@@ -247,6 +264,7 @@ export SKIP_PREP=1
 chmod 0777 test/
 chmod 0777 test/zdtm/static
 chmod 0777 test/zdtm/transition
+chmod 0777 soccr/test/
 
 # We run streaming tests separately to improve test completion times,
 # hence the exit 0.
@@ -275,6 +293,9 @@ run_non_shardable_tests() {
 	if criu/criu check --feature compress; then
 		./test/zdtm.py run -t zdtm/static/maps00 --lazy-pages --compress
 		./test/zdtm.py run -t zdtm/static/compress_pages00 --remote-lazy-pages --compress
+		./test/zdtm.py run -t zdtm/static/compress_pages00 --page-server --tls --compress
+		./test/zdtm.py run -t zdtm/static/compress_pages00 --page-server-socket --tls --compress
+		./test/zdtm.py run -t zdtm/static/compress_pages00 --page-server-socket --rpc --compress
 	else
 		echo "Skipping lazy-pages compression tests"
 	fi
@@ -341,10 +362,10 @@ run_non_shardable_tests() {
 		./test/zdtm.py run -t zdtm/static/compress_pages00 --compress-acceleration 2
 		./test/zdtm.py run -t zdtm/static/compress_pages00 -t zdtm/static/compress_pages01 --rpc
 
-		# Add parent-chain and dedup coverage for region compression.
-		./test/zdtm.py run -t zdtm/static/compress_pages_region00 --pre 2
-		./test/zdtm.py run -t zdtm/static/compress_pages_region00 --dedup
-		./test/zdtm.py run -t zdtm/static/compress_pages_region03 --pre 2
+		# Add parent-chain and dedup coverage for block compression.
+		./test/zdtm.py run -t zdtm/static/compress_pages_block00 --pre 2
+		./test/zdtm.py run -t zdtm/static/compress_pages_block00 --dedup
+		./test/zdtm.py run -t zdtm/static/compress_pages_block03 --pre 2
 	else
 		echo "Skipping memory compression ZDTM tests"
 	fi
@@ -362,18 +383,19 @@ run_non_shardable_tests() {
 		# Hugetlb mappings are not premapped. Their blocks must remain
 		# self-contained raw/zero fallbacks for PIE restore.
 		./test/zdtm.py run -t zdtm/static/maps09 --pre 2 --compress
-		./test/zdtm.py run -t zdtm/static/maps09 --pre 2 --compress-region 256K
+		./test/zdtm.py run -t zdtm/static/maps09 --pre 2 --compress-block 256K
 		./test/zdtm.py run -t zdtm/static/maps10 --pre 2 --compress
-		./test/zdtm.py run -t zdtm/static/maps10 --pre 2 --compress-region 256K
+		./test/zdtm.py run -t zdtm/static/maps10 --pre 2 --compress-block 256K
 	else
 		echo "Skipping hugetlb compression tests"
 	fi
 
-	# Incremental compression parent chains.
+	# Compression pre-dump and incremental parent-chain coverage.
 	if criu/criu check --feature compress && criu/criu check --feature mem_dirty_track; then
+		make -C test/others/compression/vma-boundary run
 		make -C test/others/compression/incremental run
 	else
-		echo "Skipping compression/incremental test"
+		echo "Skipping compression pre-dump tests"
 	fi
 
 	# Raw compression fallback image format.
@@ -482,6 +504,9 @@ run_non_shardable_tests() {
 	# compel testing
 	make -C compel/test
 
+	# soccr testing
+	make -C soccr/test
+
 	# amdgpu and cuda plugin testing
 	make amdgpu_plugin
 	make -C plugins/amdgpu/ test_topology_remap
@@ -491,8 +516,21 @@ run_non_shardable_tests() {
 	./test/zdtm.py run -t zdtm/static/maps00 -t zdtm/static/maps02 --criu-plugin amdgpu
 	./test/zdtm.py run -t zdtm/static/maps00 -t zdtm/static/maps02 --criu-plugin amdgpu cuda
 	./test/zdtm.py run -t zdtm/static/busyloop00 --criu-plugin inventory_test_enabled inventory_test_disabled
+	./test/plugins/plugins-inventory-exact-match.sh
 
-	./test/zdtm.py run -t zdtm/static/sigpending -t zdtm/static/pthread00 --mocked-cuda-checkpoint --fault 138
+	# CUDA checkpointing is supported only for native x86-64 workloads.
+	if [ "$(uname -m)" = "x86_64" ] && [ "${COMPAT_TEST:-}" != "y" ]; then
+		make -C test/cuda-checkpoint test
+
+		# Fault 138 (FI_PLUGIN_CUDA_FORCE_ENABLE) enables the mock without a GPU.
+		./test/zdtm.py run -t zdtm/static/sigpending -t zdtm/static/pthread00 \
+			--mocked-cuda-checkpoint --fault 138
+		./test/cuda-checkpoint/checkpoint-error-rollback.sh
+		python3 ./test/cuda-checkpoint/backend-errors.py
+		./test/cuda-checkpoint/backend-selection.sh
+		./test/cuda-checkpoint/restore-backend-selection.sh
+		./test/cuda-checkpoint/device-map-backends.sh
+	fi
 }
 
 # When sharding is enabled, shards 0..count-1 run sharded zdtm tests and

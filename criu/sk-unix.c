@@ -1741,7 +1741,7 @@ static int open_unixsk_pair_master(struct unix_sk_info *ui, int *new_fd)
 {
 	struct fdinfo_list_entry *fle, *fle_peer;
 	struct unix_sk_info *peer = ui->peer;
-	int sk[2], tmp;
+	int sk[2], ret;
 
 	fle = file_master(&ui->d);
 	pr_info_opening("master", ui, fle);
@@ -1765,29 +1765,39 @@ static int open_unixsk_pair_master(struct unix_sk_info *ui, int *new_fd)
 		 * Below setup_and_serve_out() will reuse this fd,
 		 * so this dups it in something else.
 		 */
-		tmp = dup(sk[0]);
-		if (tmp < 0) {
+		ret = dup(sk[0]);
+		if (ret < 0) {
 			pr_perror("Can't dup()");
-			return -1;
+			goto err;
 		}
 		close(sk[0]);
-		sk[0] = tmp;
+		sk[0] = ret;
 	}
 
-	if (setup_and_serve_out(fle_peer, sk[1])) {
+	ret = setup_and_serve_out(fle_peer, sk[1]);
+	sk[1] = -1;
+	if (ret) {
 		pr_err("Can't send pair slave\n");
-		return -1;
+		goto err;
 	}
-	sk[1] = fle_peer->fe->fd;
 
 	if (bind_unix_sk(sk[0], ui))
-		return -1;
+		goto err;
 
-	if (bind_unix_sk(sk[1], peer))
-		return -1;
+	if (bind_unix_sk(fle_peer->fe->fd, peer))
+		goto err;
 
 	*new_fd = sk[0];
 	return 1;
+err:
+	close_safe(&sk[1]);
+	close_safe(&sk[0]);
+	/*
+	 * Don't close fle_peer->fe->fd here: once setup_and_serve_out()
+	 * succeeds the descriptor is at FLE_OPEN and may already be
+	 * referenced by other restore participants.
+	 */
+	return -1;
 }
 
 static int open_unixsk_pair_slave(struct unix_sk_info *ui, int *new_fd)
@@ -1820,6 +1830,7 @@ static int setup_second_end(int *sks, struct fdinfo_list_entry *second_end)
 		ret = dup(sks[0]);
 		if (ret < 0) {
 			pr_perror("Can't dup()");
+			close(sks[1]);
 			return -1;
 		}
 		close(sks[0]);
@@ -1837,7 +1848,7 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 {
 	struct unix_sk_info *queuer = ui->queuer;
 	struct unix_sk_info *peer = ui->peer;
-	struct fdinfo_list_entry *fle;
+	struct fdinfo_list_entry *fle, *second_end = NULL;
 	int sk;
 
 	fle = file_master(&ui->d);
@@ -1882,13 +1893,17 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 			return -1;
 		}
 
-		if (send_criu_dump_resp(sks[1], true, true) == -1)
+		if (send_criu_dump_resp(sks[1], true, true) == -1) {
+			close(sks[0]);
+			close(sks[1]);
 			return -1;
+		}
 
 		close(sks[1]);
 		sk = sks[0];
 	} else if ((ui->ue->state == TCP_ESTABLISHED && ui->ue->type != SOCK_DGRAM) && queuer &&
 		   queuer->ue->ino == FAKE_INO) {
+		struct fdinfo_list_entry *queuer_fle;
 		int ret, sks[2];
 
 		if (ui->ue->shutdown != SK_SHUTDOWN__BOTH) {
@@ -1902,11 +1917,16 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 			return -1;
 		}
 
-		if (setup_second_end(sks, file_master(&queuer->d)))
+		queuer_fle = file_master(&queuer->d);
+		if (setup_second_end(sks, queuer_fle)) {
+			close(sks[0]);
 			return -1;
+		}
 
+		second_end = queuer_fle;
 		sk = sks[0];
 	} else if (ui->ue->type == SOCK_DGRAM && queuer && queuer->ue->ino == FAKE_INO) {
+		struct fdinfo_list_entry *queuer_fle;
 		struct sockaddr_un addr;
 		int sks[2];
 
@@ -1930,12 +1950,18 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 		 */
 		if (connect(sk, (struct sockaddr *)&addr, sizeof(addr.sun_family))) {
 			pr_perror("Can't clear socket's peer");
+			close(sks[0]);
+			close(sks[1]);
 			return -1;
 		}
 
-		if (setup_second_end(sks, file_master(&queuer->d)))
+		queuer_fle = file_master(&queuer->d);
+		if (setup_second_end(sks, queuer_fle)) {
+			close(sks[0]);
 			return -1;
+		}
 
+		second_end = queuer_fle;
 		sk = sks[0];
 	} else {
 		if (ui->ue->uflags & USK_CALLBACK) {
@@ -1962,16 +1988,14 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 	}
 
 	if (bind_unix_sk(sk, ui)) {
-		close(sk);
-		return -1;
+		goto err;
 	}
 
 	if (ui->ue->state == TCP_LISTEN) {
 		pr_info("\tPutting %u into listen state\n", ui->ue->ino);
 		if (listen(sk, ui->ue->backlog) < 0) {
 			pr_perror("Can't make usk listen");
-			close(sk);
-			return -1;
+			goto err;
 		}
 		ui->listen = 1;
 		wake_connected_sockets(ui);
@@ -1991,10 +2015,17 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 
 out:
 	if (restore_sk_common(sk, ui))
-		return -1;
+		goto err;
 
 	*new_fd = sk;
 	return 0;
+err:
+	if (second_end) {
+		close(second_end->fe->fd);
+		second_end->fe->fd = -1;
+	}
+	close(sk);
+	return -1;
 }
 
 static int open_unix_sk(struct file_desc *d, int *new_fd)

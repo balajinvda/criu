@@ -22,6 +22,8 @@ import time
 import urllib.error
 import urllib.request
 
+import cuda_migration
+
 # Sentinel distinguishing "runc.conf never touched" from "stashed, but the
 # file did not exist" (which stashes None).
 _RUNC_CONF_UNSET = object()
@@ -48,16 +50,27 @@ PODMAN = "podman"
 RUNC_CONF_BEGIN = "# BEGIN criu-compression-benchmark"
 RUNC_CONF_END = "# END criu-compression-benchmark"
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-MAX_REGION_SIZE = 4 * 1024 * 1024
+MAX_BLOCK_SIZE = 4 * 1024 * 1024
 MAX_COMPRESSION_ACCELERATION = 65537
 MAX_DECOMPRESSION_THREADS = 1024
 COMPRESSION_OPTIONS = {
-    "compress", "compress-region", "compress-acceleration",
+    "compress", "compress-block", "compress-acceleration",
     "decompress-threads",
 }
 HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SIGNALS = (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)
+
+
+def default_block_sizes(page_size):
+    candidates = (page_size, 64 * 1024, 256 * 1024, 1024 * 1024)
+    return list(dict.fromkeys(
+        size for size in candidates
+        if size <= MAX_BLOCK_SIZE and size % page_size == 0
+    ))
+
+
+DEFAULT_BLOCK_SIZES = default_block_sizes(PAGE_SIZE)
 
 
 class ServingBenchmark:
@@ -77,16 +90,16 @@ class ServingBenchmark:
     def podman_env(self, args):
         return podman_env(self, args)
 
-    def ensure_no_default_config_wrapper(self):
-        return ensure_no_default_config_wrapper(self)
+    def ensure_no_default_config_wrapper(self, cuda_visible_devices=None):
+        return ensure_no_default_config_wrapper(self, cuda_visible_devices)
 
     def release_runc_conf_lock(self):
         return release_runc_conf_lock(self)
 
     def set_runc_conf_for_cfg(self, path, cfg, acceleration,
-                              decompress_threads=None):
+                              decompress_threads=None, restore=False):
         return set_runc_conf_for_cfg(
-            self, path, cfg, acceleration, decompress_threads
+            self, path, cfg, acceleration, decompress_threads, restore
         )
 
     def restore_runc_conf(self):
@@ -109,6 +122,14 @@ class ServingBenchmark:
         return chat_once(
             base_url, model, prompt, max_tokens, temperature, seed, timeout,
             extra_body, self.adapter.display_name
+        )
+
+    def chat_stream_once(self, base_url, model, prompt, max_tokens,
+                         temperature, seed, timeout, operation_started_ns,
+                         extra_body=None):
+        return chat_stream_once(
+            base_url, model, prompt, max_tokens, temperature, seed, timeout,
+            operation_started_ns, extra_body, self.adapter.display_name
         )
 
     def run_trial(self, cfg, workdir, args, trial_id, keep_running=False):
@@ -196,10 +217,10 @@ def format_duration(microseconds):
 
 def cfg_label(cfg):
     if cfg["mode"] == "uncompressed":
-        return "Uncompressed"
-    if cfg["mode"] == "lz4-page":
-        return f"LZ4 per page ({PAGE_SIZE // 1024} KiB blocks)"
-    return f"LZ4 regions ({cfg['region_size'] // 1024} KiB blocks)"
+        label = "Uncompressed"
+    else:
+        label = f"LZ4 blocks ({cfg['block_size'] // 1024} KiB)"
+    return f"{cfg['cuda_backend']} / {label}" if cfg.get("cuda_backend") else label
 
 
 def decompress_threads_label(threads):
@@ -225,6 +246,35 @@ def json_object(value):
     if not isinstance(obj, dict):
         raise argparse.ArgumentTypeError("expected a JSON object")
     return obj
+
+
+def cuda_benchmark_identity(args):
+    """Identify the executable artifacts, including locally modified builds."""
+    binaries = {"criu": shutil.which("criu"),
+                "plugin": os.path.join(args.criu_libdir, "cuda_plugin.so")}
+    if "cuda-checkpoint" in args.cuda_backends:
+        binaries["cuda-checkpoint"] = shutil.which("cuda-checkpoint")
+    if getattr(args, "cuda_checkpoint_launch_job", False):
+        binaries["cuda-checkpoint-launcher"] = args.cuda_checkpoint_binary
+    identity = {"binaries": {}}
+    for name, path in binaries.items():
+        if not path or not os.path.isfile(path):
+            raise RuntimeError(f"CUDA comparison requires {name}: {path}")
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        identity["binaries"][name] = {"path": os.path.realpath(path),
+                                       "sha256": digest.hexdigest()}
+    for name, command in (
+        ("driver", ["nvidia-smi", "--query-gpu=uuid,name,driver_version",
+                    "--format=csv,noheader"]),
+        ("runc", ["runc", "--version"]),
+    ):
+        result = subprocess.run(command, capture_output=True, text=True,
+                                check=True)
+        identity[name] = result.stdout.strip()
+    return identity
 
 
 def collect_system_info():
@@ -342,7 +392,7 @@ def wait_health(base_url, health_path, timeout, container_name=None,
                         f"before becoming healthy\n\n"
                         f"{container_diagnostics(container_name)}"
                     ) from e
-            time.sleep(1)
+            time.sleep(0.1)
     detail = ""
     if container_name:
         detail = "\n\n" + container_diagnostics(container_name)
@@ -370,6 +420,104 @@ def chat_once(base_url, model, prompt, max_tokens, temperature, seed, timeout,
     if not content.strip():
         raise RuntimeError(f"{framework_name} validation returned an empty response")
     return latency_us, content
+
+
+def chat_stream_once(base_url, model, prompt, max_tokens, temperature, seed,
+                     timeout, operation_started_ns, extra_body=None,
+                     framework_name="serving"):
+    """Issue one streaming chat request and timestamp its readiness events.
+
+    Absolute offsets are measured from ``operation_started_ns`` so cold start
+    and restore use the same boundary. Request latency is also returned to
+    distinguish serving time from startup/restore time.
+    """
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "seed": seed,
+        "stream": True,
+    }
+    if extra_body:
+        payload.update(extra_body)
+    data = json.dumps(payload).encode()
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/v1/chat/completions",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer EMPTY",
+        },
+        method="POST",
+    )
+    request_started_ns = time.monotonic_ns()
+    first_event_ns = None
+    first_token_ns = None
+    chunks = []
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        response_headers_ns = time.monotonic_ns()
+        for raw_line in response:
+            line = raw_line.decode(errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            now_ns = time.monotonic_ns()
+            if first_event_ns is None:
+                first_event_ns = now_ns
+            event = line[5:].strip()
+            if event == "[DONE]":
+                break
+            try:
+                document = json.loads(event)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    f"{framework_name} returned malformed streaming JSON: "
+                    f"{event[:200]}"
+                ) from error
+            delta = document.get("choices", [{}])[0].get("delta", {})
+            text = delta.get("content") or delta.get("reasoning_content") or ""
+            if text:
+                if first_token_ns is None:
+                    first_token_ns = now_ns
+                chunks.append(text)
+    completed_ns = time.monotonic_ns()
+    content = "".join(chunks)
+    if first_token_ns is None or not content.strip():
+        raise RuntimeError(
+            f"{framework_name} streaming validation returned no output token"
+        )
+
+    def elapsed_us(end_ns, start_ns):
+        return (end_ns - start_ns) // 1000
+
+    return {
+        "request_us": elapsed_us(completed_ns, request_started_ns),
+        "request_to_headers_us": elapsed_us(
+            response_headers_ns, request_started_ns
+        ),
+        "request_to_first_event_us": elapsed_us(
+            first_event_ns, request_started_ns
+        ),
+        "request_to_first_token_us": elapsed_us(
+            first_token_ns, request_started_ns
+        ),
+        "operation_to_request_us": elapsed_us(
+            request_started_ns, operation_started_ns
+        ),
+        "operation_to_headers_us": elapsed_us(
+            response_headers_ns, operation_started_ns
+        ),
+        "operation_to_first_event_us": elapsed_us(
+            first_event_ns, operation_started_ns
+        ),
+        "operation_to_first_token_us": elapsed_us(
+            first_token_ns, operation_started_ns
+        ),
+        "operation_to_response_complete_us": elapsed_us(
+            completed_ns, operation_started_ns
+        ),
+        "content": content,
+    }
 
 
 def format_cmd(cmd):
@@ -442,19 +590,43 @@ def run_cmd(cmd, env=None, check=True):
     return r
 
 
+def remove_container(name, attempts=3, retry_delay=1):
+    """Remove a container, tolerating a runtime's delayed PID-1 exit.
+
+    Restored SGLang containers can finish their graceful shutdown just after
+    Podman's force-removal timeout. A subsequent removal succeeds once the
+    runtime has reaped PID 1, so do not turn that transient race into a failed
+    benchmark trial. Persistent failures still raise with Podman's final
+    diagnostic.
+    """
+    last = None
+    for attempt in range(attempts):
+        last = run_cmd([PODMAN, "rm", "-f", name], check=False)
+        if last.returncode == 0:
+            return
+        if attempt + 1 < attempts:
+            time.sleep(retry_delay)
+    detail = (last.stderr or last.stdout).strip()
+    raise RuntimeError(
+        f"{format_cmd([PODMAN, 'rm', '-f', name])} failed after "
+        f"{attempts} attempts: {detail[-6000:]}"
+    )
+
+
 def podman_env(benchmark, args):
     env = os.environ.copy()
     # Start CRIU without global, user, or inherited configuration. runc still
     # supplies the benchmark-owned runc.conf through the RPC request.
     env.pop("CRIU_CONFIG_FILE", None)
-    wrapper_dir = benchmark.ensure_no_default_config_wrapper()
+    visible = args.cuda_visible_devices if getattr(args, "cuda_migration", None) else None
+    wrapper_dir = benchmark.ensure_no_default_config_wrapper(visible)
     env["PATH"] = wrapper_dir + os.pathsep + env.get("PATH", os.defpath)
     if args.criu_libdir:
         env["CRIU_LIBS_DIR"] = args.criu_libdir
     return env
 
 
-def ensure_no_default_config_wrapper(benchmark):
+def ensure_no_default_config_wrapper(benchmark, cuda_visible_devices=None):
     runtime = benchmark.state
     if runtime.criu_wrapper_dir is not None:
         return runtime.criu_wrapper_dir
@@ -471,6 +643,10 @@ def ensure_no_default_config_wrapper(benchmark):
         with os.fdopen(fd, "w") as output:
             fd = -1
             output.write("#!/bin/sh\n")
+            if cuda_visible_devices is not None:
+                # Podman's checkpoint path may pass only PATH to runc.
+                # Set visibility here so CRIU records the workload's view.
+                output.write(f"export CUDA_VISIBLE_DEVICES={shlex.quote(cuda_visible_devices)}\n")
             output.write(f"exec {shlex.quote(criu)} --no-default-config \"$@\"\n")
     finally:
         if fd >= 0:
@@ -768,10 +944,7 @@ def strip_compression_runc_options(text):
 def compression_config_lines(cfg, acceleration, decompress_threads=None):
     if cfg["mode"] == "uncompressed":
         return []
-    if cfg["mode"] == "lz4-page":
-        lines = ["compress"]
-    else:
-        lines = [f"compress-region {cfg['region_size']}"]
+    lines = [f"compress-block {cfg['block_size']}"]
     if acceleration != 1:
         lines.append(f"compress-acceleration {acceleration}")
     if decompress_threads is not None:
@@ -779,8 +952,29 @@ def compression_config_lines(cfg, acceleration, decompress_threads=None):
     return lines
 
 
+def cuda_backend_config_base(base, manage_device_map=False):
+    """Replace only options owned by a CUDA backend comparison."""
+    kept = []
+    for line in base.splitlines():
+        try:
+            fields = shlex.split(line, comments=True)
+        except ValueError as err:
+            raise ValueError(f"cannot parse CRIU config line {line!r}: {err}") from err
+        if fields:
+            option, _, inline = fields[0].lstrip("-").partition("=")
+            value = inline or (fields[1] if len(fields) > 1 else "")
+            owned = ("cuda_plugin.backend=",)
+            if manage_device_map:
+                owned += ("cuda_plugin.device-map=",)
+            if option == "libdir" or (option == "plugin-option" and
+                                      value.startswith(owned)):
+                continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def set_runc_conf_for_cfg(benchmark, path, cfg, acceleration,
-                          decompress_threads=None):
+                          decompress_threads=None, restore=False):
     runtime = benchmark.state
     if runtime.original_runc_conf is _RUNC_CONF_UNSET:
         path, original = acquire_runc_conf(benchmark, path)
@@ -790,6 +984,12 @@ def set_runc_conf_for_cfg(benchmark, path, cfg, acceleration,
 
     base = strip_compression_runc_options(runtime.original_runc_conf)
     lines = compression_config_lines(cfg, acceleration, decompress_threads)
+    if cfg.get("cuda_backend"):
+        base = cuda_backend_config_base(base, bool(cfg.get("cuda_device_map")))
+        lines += [f"libdir {json.dumps(cfg['criu_libdir'])}",
+                  f"plugin-option cuda_plugin.backend={cfg['cuda_backend']}"]
+        if restore and cfg.get("cuda_device_map"):
+            lines.append(f"plugin-option cuda_plugin.device-map={cfg['cuda_device_map']}")
     if lines:
         block = "\n".join([RUNC_CONF_BEGIN, *lines, RUNC_CONF_END])
         text = f"{base}\n\n{block}\n" if base else f"{block}\n"
@@ -846,7 +1046,7 @@ def build_container_cmd(benchmark, name, args):
     if args.accelerator == "gpu":
         cmd += [
             "--device", args.gpu_device,
-            "--env", f"CUDA_VISIBLE_DEVICES={args.cuda_visible_devices}",
+            "--env", f"CUDA_VISIBLE_DEVICES={args.cuda_visible_devices or '0'}",
             "--env", "NCCL_P2P_DISABLE=1",
             "--env", "NCCL_SHM_DISABLE=1",
             "--env", "NCCL_IB_DISABLE=1",
@@ -862,6 +1062,9 @@ def build_container_cmd(benchmark, name, args):
         cmd.append(item)
     for item in args.ulimit:
         cmd += ["--ulimit", item]
+    extra_podman_args = getattr(benchmark.adapter, "extra_podman_args", None)
+    if extra_podman_args is not None:
+        cmd += extra_podman_args(args)
 
     cmd += benchmark.adapter.server_argv(args)
 
@@ -874,10 +1077,15 @@ def start_container(benchmark, name, args):
 
     run_cmd([PODMAN, "rm", "-f", name], check=False)
     benchmark.state.started_containers.add(name)
+    started_ns = time.monotonic_ns()
     run_cmd(cmd, env=podman_env(benchmark, args))
     print(f"  waiting for {name} health on {args.base_url}", flush=True)
     wait_health(args.base_url, args.health_path, args.wait_seconds, name,
                 benchmark.adapter.display_name)
+    return {
+        "started_ns": started_ns,
+        "to_health_us": (time.monotonic_ns() - started_ns) // 1000,
+    }
 
 
 def checkpoint_container(benchmark, name, archive, cfg, args):
@@ -889,6 +1097,7 @@ def checkpoint_container(benchmark, name, archive, cfg, args):
         "--export", archive,
         "--compress", args.archive_compression,
         "--ignore-volumes",
+        "--file-locks",
         "--tcp-established",
     ]
     if args.print_stats:
@@ -960,7 +1169,7 @@ def inventory_entry_from_archive(archive):
 
 def verify_archive_compression(archive, cfg):
     entry = inventory_entry_from_archive(archive)
-    expected = {"uncompressed": 0, "lz4-page": 1, "lz4-region": 2}[cfg["mode"]]
+    expected = {"uncompressed": 0, "lz4-block": 1}[cfg["mode"]]
     try:
         actual = int(entry.get("compress", 0))
     except (TypeError, ValueError) as exc:
@@ -970,17 +1179,17 @@ def verify_archive_compression(archive, cfg):
             "checkpoint compression mode does not match the benchmark "
             f"configuration: expected {expected}, found {actual}"
         )
-    if expected == 2:
+    if expected == 1:
         try:
-            region_size = int(entry.get("compress_region_size", 0))
+            block_size = int(entry.get("compress_block_size", 0))
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
-                "checkpoint inventory has an invalid compression region size"
+                "checkpoint inventory has an invalid compression block size"
             ) from exc
-        if region_size != cfg["region_size"]:
+        if block_size != cfg["block_size"]:
             raise RuntimeError(
-                "checkpoint compression region does not match the benchmark "
-                f"configuration: expected {cfg['region_size']}, found {region_size}"
+                "checkpoint compression block does not match the benchmark "
+                f"configuration: expected {cfg['block_size']}, found {block_size}"
             )
     return actual
 
@@ -990,19 +1199,32 @@ def restore_container(benchmark, name, archive, args):
         PODMAN, "container", "restore",
         "--import", archive,
         "--ignore-volumes",
+        "--file-locks",
         "--tcp-established",
     ]
     if args.print_stats:
         cmd.append("--print-stats")
 
-    t0 = time.monotonic()
+    started_ns = time.monotonic_ns()
     benchmark.state.started_containers.add(name)
     r = run_cmd(cmd, env=podman_env(benchmark, args))
-    restore_us = int((time.monotonic() - t0) * 1e6)
+    command_complete_ns = time.monotonic_ns()
+    restore_us = (command_complete_ns - started_ns) // 1000
+    # A memory-released serving process may deliberately report unhealthy
+    # until its accelerator allocations and worker loops are resumed. Resume
+    # immediately after the runtime restore, before polling application health.
+    after_restore = getattr(benchmark.adapter, "after_restore", None)
+    if after_restore is not None:
+        after_restore(args)
     print(f"  waiting for restored {name} health on {args.base_url}", flush=True)
     wait_health(args.base_url, args.health_path, args.wait_seconds, name,
                 benchmark.adapter.display_name)
-    return restore_us, r.stdout.strip()
+    return {
+        "started_ns": started_ns,
+        "command_us": restore_us,
+        "to_health_us": (time.monotonic_ns() - started_ns) // 1000,
+        "stats": r.stdout.strip(),
+    }
 
 
 def run_trial(benchmark, cfg, workdir, args, trial_id, keep_running=False):
@@ -1013,33 +1235,61 @@ def run_trial(benchmark, cfg, workdir, args, trial_id, keep_running=False):
     elif args.archive_compression == "zstd":
         archive += ".zst"
 
-    benchmark.start_container(name, args)
+    cold_start = benchmark.start_container(name, args)
     request_model = args.served_model_name or args.model
+    cold_timing = benchmark.chat_stream_once(
+        args.base_url, request_model, args.prompt, args.max_tokens,
+        args.temperature, args.seed, args.request_timeout,
+        cold_start["started_ns"], args.chat_extra_json,
+    )
     for _ in range(args.warmup_requests):
         benchmark.chat_once(args.base_url, request_model, args.prompt,
                             args.max_tokens, args.temperature, args.seed,
                             args.request_timeout, args.chat_extra_json)
-    pre_us, pre_content = benchmark.chat_once(
+    pre_timing = benchmark.chat_stream_once(
         args.base_url, request_model, args.prompt, args.max_tokens,
         args.temperature, args.seed, args.request_timeout,
-        args.chat_extra_json,
+        cold_start["started_ns"], args.chat_extra_json,
     )
+    pre_us = pre_timing["request_us"]
+    pre_content = pre_timing["content"]
+    migration = getattr(args, "cuda_migration", None)
+    placement = {}
+    if migration:
+        placement["before"] = cuda_migration.verify(name, migration, workdir, "before")
+    before_checkpoint = getattr(benchmark.adapter, "before_checkpoint", None)
+    if before_checkpoint is not None:
+        before_checkpoint(args)
     checkpoint_us, checkpoint_stats = benchmark.checkpoint_container(
         name, archive, cfg, args
     )
     inventory_compress_mode = verify_archive_compression(archive, cfg)
-    run_cmd([PODMAN, "rm", "-f", name])
+    remove_container(name)
     benchmark.state.started_containers.discard(name)
-    restore_us, restore_stats = benchmark.restore_container(name, archive, args)
-    post_us, post_content = benchmark.chat_once(
+    if migration:
+        set_runc_conf_for_cfg(benchmark, args.runc_conf, cfg,
+                             args.compress_acceleration, args.decompress_threads,
+                             restore=True)
+    restore_timing = benchmark.restore_container(name, archive, args)
+    post_timing = benchmark.chat_stream_once(
         args.base_url, request_model, args.prompt, args.max_tokens,
         args.temperature, args.seed, args.request_timeout,
-        args.chat_extra_json,
+        restore_timing["started_ns"], args.chat_extra_json,
     )
+    post_us = post_timing["request_us"]
+    post_content = post_timing["content"]
+    if migration:
+        placement["after"] = cuda_migration.verify(
+            name, migration, workdir, "after", placement["before"]
+        )
+        placement["verified"] = True
     pre_digest = hashlib.sha256(pre_content.encode()).hexdigest()
     post_digest = hashlib.sha256(post_content.encode()).hexdigest()
     valid = pre_digest == post_digest
     if not valid:
+        with open(os.path.join(workdir, "validation.json"), "w") as output:
+            json.dump({"before": pre_content, "after": post_content}, output,
+                      indent=2)
         raise RuntimeError(
             "deterministic validation response changed after restore: "
             f"before_sha256={pre_digest}, after_sha256={post_digest}"
@@ -1049,22 +1299,44 @@ def run_trial(benchmark, cfg, workdir, args, trial_id, keep_running=False):
         # cleanup. Earlier trials must release the shared host-network port.
         benchmark.state.started_containers.discard(name)
     else:
-        run_cmd([PODMAN, "rm", "-f", name])
+        remove_container(name)
         benchmark.state.started_containers.discard(name)
 
     return {
         "archive_size": os.path.getsize(archive),
         "inventory_compress_mode": inventory_compress_mode,
         "checkpoint_wall_us": checkpoint_us,
-        "restore_wall_us": restore_us,
+        "restore_wall_us": restore_timing["command_us"],
+        "server_start_to_health_us": cold_start["to_health_us"],
+        "cold_start_to_first_token_us": cold_timing[
+            "operation_to_first_token_us"
+        ],
+        "cold_start_to_response_complete_us": cold_timing[
+            "operation_to_response_complete_us"
+        ],
+        "cold_start_request_ttft_us": cold_timing[
+            "request_to_first_token_us"
+        ],
+        "restore_to_health_us": restore_timing["to_health_us"],
+        "restore_to_first_token_us": post_timing[
+            "operation_to_first_token_us"
+        ],
+        "restore_to_response_complete_us": post_timing[
+            "operation_to_response_complete_us"
+        ],
+        "restore_request_ttft_us": post_timing[
+            "request_to_first_token_us"
+        ],
         "pre_request_us": pre_us,
         "post_request_us": post_us,
         "checkpoint_stats": checkpoint_stats,
-        "restore_stats": restore_stats,
+        "restore_stats": restore_timing["stats"],
         "validation_response_sha256": post_digest,
+        "cache_policy": "warm",
         "valid": valid,
         "framework": benchmark.adapter.key,
         "container_name": name if keep_running else None,
+        **({"cuda_migration": placement} if migration else {}),
     }
 
 
@@ -1154,13 +1426,14 @@ def run_main(benchmark, argv=None, description=None):
     ap.add_argument("--container-name", default=adapter.default_container_name)
     ap.add_argument("-n", "--iterations", type=int, default=3)
     ap.add_argument("--modes", nargs="+",
-                    default=["uncompressed", "lz4-page", "lz4-region"],
-                    choices=["uncompressed", "lz4-page", "lz4-region"],
+                    default=["uncompressed", "lz4-block"],
+                    choices=["uncompressed", "lz4-block"],
                     help="CRIU memory page compression modes to compare")
-    ap.add_argument("--region-sizes", nargs="+", type=int,
-                    default=[65536, 262144, 1048576],
-                    help="Region sizes in bytes when --modes contains "
-                         "lz4-region")
+    ap.add_argument("--block-sizes", nargs="+", type=int,
+                    default=DEFAULT_BLOCK_SIZES,
+                    help="Block sizes in bytes when --modes contains "
+                         "lz4-block (default: page size and supported values "
+                         "among 64K, 256K, and 1M)")
     ap.add_argument("--compress-acceleration", type=int, default=1,
                     help="CRIU LZ4 acceleration level")
     ap.add_argument("--decompress-threads", type=int, default=None,
@@ -1180,7 +1453,8 @@ def run_main(benchmark, argv=None, description=None):
                     help="GPU device selector passed to podman --device")
     ap.add_argument("--security-opt", default="label=disable",
                     help="Security option passed to podman --security-opt")
-    ap.add_argument("--cuda-visible-devices", default="0")
+    ap.add_argument("--cuda-visible-devices", default=None,
+                    help="CUDA_VISIBLE_DEVICES for the workload (default: 0)")
     ap.add_argument("--shm-size", default="32g")
     adapter.add_resource_arguments(ap)
     ap.add_argument("--prompt", default="Say hello in one short sentence.")
@@ -1228,14 +1502,14 @@ def run_main(benchmark, argv=None, description=None):
             not 0 <= args.decompress_threads <= MAX_DECOMPRESSION_THREADS:
         ap.error("--decompress-threads must be between 0 and "
                  f"{MAX_DECOMPRESSION_THREADS}")
-    if any(size <= 0 or size > MAX_REGION_SIZE or size % PAGE_SIZE
-           for size in args.region_sizes):
-        ap.error(f"--region-sizes must be positive multiples of {PAGE_SIZE} "
-                 f"not exceeding {MAX_REGION_SIZE}")
+    if any(size <= 0 or size > MAX_BLOCK_SIZE or size % PAGE_SIZE
+           for size in args.block_sizes):
+        ap.error(f"--block-sizes must be positive multiples of {PAGE_SIZE} "
+                 f"not exceeding {MAX_BLOCK_SIZE}")
     if len(args.modes) != len(set(args.modes)):
         ap.error("--modes must not contain duplicate values")
-    if len(args.region_sizes) != len(set(args.region_sizes)):
-        ap.error("--region-sizes must not contain duplicate values")
+    if len(args.block_sizes) != len(set(args.block_sizes)):
+        ap.error("--block-sizes must not contain duplicate values")
     if any(item.split("=", 1)[0] in HF_TOKEN_ENV_VARS for item in args.env):
         ap.error("set Hugging Face tokens in the host environment instead of "
                  "passing their values through --env")
@@ -1257,6 +1531,8 @@ def run_main(benchmark, argv=None, description=None):
     info = collect_system_info()
     print()
     adapter.prepare_args(args)
+    if getattr(args, "cuda_backends", None):
+        info["cuda_benchmark"] = cuda_benchmark_identity(args)
     if args.prompt_file:
         prompt = read_file(args.prompt_file)
         if prompt is None:
@@ -1277,11 +1553,18 @@ def run_main(benchmark, argv=None, description=None):
 
     cfgs = []
     for mode in args.modes:
-        if mode == "lz4-region":
-            for rs in args.region_sizes:
-                cfgs.append({"mode": "lz4-region", "region_size": rs})
+        if mode == "lz4-block":
+            for bs in args.block_sizes:
+                cfgs.append({"mode": "lz4-block", "block_size": bs})
         else:
-            cfgs.append({"mode": mode, "region_size": 0})
+            cfgs.append({"mode": mode, "block_size": 0})
+    if getattr(args, "cuda_backends", None):
+        cfgs = [dict(cfg, cuda_backend=backend,
+                     criu_libdir=os.path.abspath(args.criu_libdir))
+                for backend in args.cuda_backends for cfg in cfgs]
+    if getattr(args, "cuda_migration", None):
+        for cfg in cfgs:
+            cfg["cuda_device_map"] = args.cuda_migration["device_map"]
     labels = [cfg_label(cfg) for cfg in cfgs]
 
     print(f"  Config : {args.iterations}+1 iterations, "
@@ -1299,6 +1582,21 @@ def run_main(benchmark, argv=None, description=None):
         print(f"  Ulimit : {','.join(args.ulimit)}")
 
     results = {label: [] for label in labels}
+    warmups = {label: [] for label in labels}
+    failures = []
+
+    def save_results(status):
+        if not args.json:
+            return
+        destination = os.path.abspath(args.json)
+        with open(destination + ".tmp", "w") as output:
+            json.dump({"system": info, "framework": adapter.key,
+                       "config": json_config(args), "results": results,
+                       "warmups": warmups, "failures": failures,
+                       "status": status}, output, indent=2)
+        os.replace(destination + ".tmp", destination)
+
+    save_results("running")
     total = args.iterations + 1
     trial = 0
     for i in range(total):
@@ -1315,33 +1613,38 @@ def run_main(benchmark, argv=None, description=None):
                           i == total - 1 and
                           config_index == len(configurations) - 1)
                 result = benchmark.run_trial(cfg, workdir, args, trial, retain)
-                if not warmup:
-                    results[label].append(result)
             except Exception as e:
+                failures.append({"trial": trial, "warmup": warmup,
+                                "configuration": cfg, "error": str(e),
+                                "artifacts": workdir})
                 runtime.tempdirs.discard(workdir)
                 print(f"\n  ERROR: {label}: {e}", file=sys.stderr)
                 print(f"  Artifacts preserved in {workdir}", file=sys.stderr)
                 print(container_diagnostics(
                     f"{args.container_name}-{os.getpid()}-{trial}"),
                       file=sys.stderr)
+                try:
+                    save_results("failed")
+                except OSError as save_error:
+                    print(f"Unable to save failed trial: {save_error}",
+                          file=sys.stderr)
                 raise
             else:
+                result.update(trial=trial, configuration=cfg)
+                samples = warmups if warmup else results
+                samples[label].append(result)
                 shutil.rmtree(workdir)
                 runtime.tempdirs.discard(workdir)
+            save_results("running")
         print(f"  completed {'warmup' if warmup else f'{i}/{args.iterations}'}")
 
     benchmark.report(results, labels)
-
-    if args.json:
-        with open(args.json, "w") as f:
-            json.dump({"system": info,
-                       "framework": adapter.key,
-                       "config": json_config(args),
-                       "results": results}, f, indent=2)
-        print(f"\nResults written to {args.json}")
 
     # A successful benchmark must not report success until the host-wide
     # CRIU configuration is restored. atexit remains a fallback for errors
     # and signals, where cleanup diagnostics cannot change an existing status.
     benchmark.restore_runc_conf()
+    save_results("complete")
+    if args.json:
+        print(f"Results written to {args.json}")
     print()

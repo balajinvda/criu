@@ -65,9 +65,15 @@ This directory contains technical documentation detailing the internal implement
 * [TTYs](ttys.md): The complex state of terminal devices and PTY pairs.
 * [CGroups](cgroups.md): Restoring cgroup hierarchy and membership.
 
-## Security & Kernel Features
+## Security
 
+* [Image Security & State Restoration](security/image-security.md): Security
+  boundaries, privilege risks, and operational recommendations for handling
+  CRIU images.
 * [AppArmor](apparmor.md): Handling AppArmor profiles during dump and restore.
+
+## Kernel Features
+
 * [ARM64 GCS](arm64-gcs.md): Guarded Control Stack support on AArch64.
 * [BPF Maps](bpf-maps.md): Experimental support for checkpointing BPF map data.
 * [Code Blobs](code-blobs.md): Management of PIE blobs (parasite, restorer).

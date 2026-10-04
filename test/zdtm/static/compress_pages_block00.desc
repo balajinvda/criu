@@ -1,0 +1,1 @@
+{'feature': 'compress', 'opts': '--compress-block=256K', 'ropts': '--decompress-threads=0'}

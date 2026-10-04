@@ -7,12 +7,14 @@ import sys
 import pycriu.images
 
 
+COMPRESS_OFF = 0
+COMPRESS_BLOCK = 1
 PE_PRESENT = 4
-EXPECTED_REGION_SIZE = 64 * 1024
+EXPECTED_BLOCK_SIZES = {"block-4k": 4 * 1024, "block-64k": 64 * 1024}
 
 
 def inventory_compression(directory, mode, version):
-    expected_mode = {"plain": 0, "page": 1, "region": 2}[mode]
+    expected_mode = COMPRESS_OFF if mode == "plain" else COMPRESS_BLOCK
     expected_version = int(version)
 
     with open(os.path.join(directory, "inventory.img"), "rb") as image:
@@ -31,18 +33,19 @@ def inventory_compression(directory, mode, version):
         )
         return 1
 
-    region_size = inventory.get("compress_region_size")
-    if expected_mode == 2:
-        if int(region_size or 0) != EXPECTED_REGION_SIZE:
+    block_size = inventory.get("compress_block_size")
+    if expected_mode == COMPRESS_BLOCK:
+        expected_block_size = EXPECTED_BLOCK_SIZES[mode]
+        if int(block_size or 0) != expected_block_size:
             print(
-                "FAIL: %s inventory region size is %s, expected 65536"
-                % (directory, region_size)
+                "FAIL: %s inventory block size is %s, expected %s"
+                % (directory, block_size, expected_block_size)
             )
             return 1
-    elif region_size is not None:
+    elif block_size is not None:
         print(
-            "FAIL: %s has unexpected compression region size %s"
-            % (directory, region_size)
+            "FAIL: %s has unexpected compression block size %s"
+            % (directory, block_size)
         )
         return 1
 
@@ -100,7 +103,9 @@ def main():
 
     inventory = subparsers.add_parser("inventory-compression")
     inventory.add_argument("directory")
-    inventory.add_argument("mode", choices=("plain", "page", "region"))
+    inventory.add_argument(
+        "mode", choices=("plain", *EXPECTED_BLOCK_SIZES.keys())
+    )
     inventory.add_argument("version", type=int)
 
     payload = subparsers.add_parser("present-payload")

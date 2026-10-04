@@ -134,9 +134,9 @@ struct page_pipe {
 	/*
 	 * When set, the next page added starts a fresh iov instead of
 	 * coalescing with the previous one, even at a contiguous address.
-	 * Used in region-compression mode to keep a pagemap entry (and
-	 * thus an LZ4 region) from spanning a VMA boundary, which the
-	 * per-VMA restore reader cannot split on a region boundary.
+	 * Used in block-compression mode to keep a pagemap entry (and
+	 * thus an LZ4 block) from spanning a VMA boundary, which the
+	 * per-VMA restore reader cannot split on a block boundary.
 	 * Self-clearing: consumed by the next added page.
 	 */
 	bool break_iov;

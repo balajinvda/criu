@@ -1,12 +1,19 @@
 #ifndef __CR_PAGE_READ_H__
 #define __CR_PAGE_READ_H__
 
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 
 #include "common/list.h"
 #include "images/pagemap.pb-c.h"
 #include "page.h"
+#include "pagemap-block.h"
+
+#define ASYNC_BATCH_MAX_BYTES (32UL << 20)
+#define ASYNC_BATCH_MAX_PAGES (ASYNC_BATCH_MAX_BYTES / PAGE_SIZE)
 
 /*
  * page_read -- engine, that reads pages from image file(s)
@@ -45,7 +52,61 @@
  * All this is implemented in read_pagemap_page.
  */
 
+/*
+ * One "job" for the preadv() syscall in pagemap.c
+ */
+struct page_read_iov {
+	off_t from;       /* offset in pi file where to start reading from */
+	off_t end;        /* exclusive end offset in the pages image */
+	struct iovec *to; /* destination iovs */
+	unsigned int nr;  /* their number */
+	enum restore_vma_io_storage storage;
+
+	struct page_block_layout b_layout;
+	unsigned long n_pages; /* Total uncompressed pages in this batch (cap input) */
+	uint16_t *block_pages;
+	unsigned long rio_cs_off;
+	unsigned long rio_bp_off;
+
+	struct list_head l;
+};
+
 struct encoded_read_ctx;
+struct page_read;
+
+struct page_read_block_state {
+	/*
+	 * Index into pe->blocks->block_sizes[] for the current pagemap
+	 * entry. Tracks which block we are on when reading or skipping.
+	 * Reset to 0 on advance().
+	 */
+	size_t block_idx;
+
+	/*
+	 * Pages already consumed (read or skipped) from the current block
+	 * (0 when granularity is one page). Reset to 0 on advance() and
+	 * whenever the reader crosses a block boundary.
+	 */
+	unsigned int block_offset;
+
+	/*
+	 * Last decompressed block for repeated partial reads. A page
+	 * reader belongs to one pages image, so its virtual address and size
+	 * uniquely identify the cached block. A zero size means no valid cache.
+	 */
+	char *cache_buf;
+	unsigned long cache_vaddr;
+	size_t cache_size;
+
+	/*
+	 * Bounded encoded buffers and workers. All readers in an incremental
+	 * parent chain use the context owned by encoded_owner, so a sync
+	 * initiated by a parent cannot acquire a second batch lease and deadlock
+	 * against its child. Only the owner releases the context at close.
+	 */
+	struct encoded_read_ctx *encoded_ctx;
+	struct page_read *encoded_owner;
+};
 
 struct page_read {
 	/* reads page from current pagemap */
@@ -86,10 +147,13 @@ struct page_read {
 	 * that. Cached here to avoid a fcntl(F_GETFL) syscall per page read. */
 	bool use_direct;
 
+	/* Whether this page read is served by the image streamer, not by disk */
+	bool streamed;
+
 	/* Private data of reader */
 	struct cr_img *pmi;
 	struct cr_img *pi;
-	u32 pages_img_id;
+	uint32_t pages_img_id;
 
 	/* Current pagemap we are on */
 	PagemapEntry *pe;
@@ -106,38 +170,7 @@ struct page_read {
 	/* Alignment bytes a sequential image-streamer reader must discard. */
 	size_t stream_padding;
 
-	/*
-	 * Index into pe->compressed_size[] for the current pagemap
-	 * entry. Tracks which compressed block (page in per-page mode,
-	 * region in region mode) we are on when reading or skipping
-	 * compressed pages. Reset to 0 on advance().
-	 */
-	size_t compressed_size_index;
-
-	/*
-	 * In region mode: pages already consumed (read or skipped) from
-	 * the current block. Always 0 in per-page mode. Reset to 0 on
-	 * advance() and whenever the reader crosses a block boundary.
-	 */
-	unsigned int region_block_offset;
-
-	/*
-	 * Last decompressed region block for repeated partial reads. A page
-	 * reader belongs to one pages image, so its virtual address and size
-	 * uniquely identify the cached block. A zero size means no valid cache.
-	 */
-	char *cached_region;
-	unsigned long cached_region_vaddr;
-	size_t cached_region_size;
-
-	/*
-	 * Bounded encoded buffers and workers. All readers in an incremental
-	 * parent chain use the context owned by encoded_read_owner, so a sync
-	 * initiated by a parent cannot acquire a second batch lease and deadlock
-	 * against its child. Only the owner releases the context at close.
-	 */
-	struct encoded_read_ctx *encoded_read_ctx;
-	struct page_read *encoded_read_owner;
+	struct page_read_block_state blk;
 
 	/* Record consequent neighbour iov-ecs to punch together */
 	struct iovec bunch;
@@ -166,6 +199,7 @@ struct page_read {
 #define PR_TYPE_MASK 0x3
 #define PR_MOD	     0x4 /* Will need to modify */
 #define PR_REMOTE    0x8
+#define PR_FORCE_LOCAL 0x10 /* Read the images from disk, not from the streamer */
 
 /*
  * -1 -- error
@@ -221,6 +255,8 @@ int page_read_range_has_parent(struct page_read *pr, unsigned long start,
  * PAGE_SIZE is not a compile-time constant on aarch64, so the probe
  * buffer comes from posix_memalign().
  */
+int pread_full(int fd, void *buf, size_t count, off_t offset);
+
 int probe_pages_o_direct(int fd);
 
 /*
@@ -277,6 +313,27 @@ static inline off_t pagemap_page_align_offset(off_t offset)
 	off_t mask = ~((off_t)PAGE_SIZE - 1);
 
 	return (offset + (off_t)PAGE_SIZE - 1) & mask;
+}
+
+static inline unsigned int pagemap_block_pages(const PagemapEntry *pe)
+{
+	if (pe && pe->blocks && pe->blocks->pages_per_block > 0)
+		return pe->blocks->pages_per_block;
+	return 1;
+}
+
+static inline unsigned long pagemap_align_down(const PagemapEntry *pe, unsigned long nr_pages)
+{
+	unsigned int bp = pagemap_block_pages(pe);
+
+	if (bp > 1) {
+		unsigned long aligned = nr_pages - (nr_pages % bp);
+
+		if (aligned)
+			return aligned;
+	}
+
+	return nr_pages;
 }
 
 #endif /* __CR_PAGE_READ_H__ */

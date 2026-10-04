@@ -310,11 +310,11 @@ function assert_pagemap_entry_uncompressed {
 		assert-entry-uncompressed "$dir"
 }
 
-function assert_region_pagemap {
+function assert_block_pagemap {
 	local dir=$1
 
 	PYTHONPATH="${BASE_DIR}/lib" python3 "$COMPRESSION_IMAGE_HELPER" \
-		assert-region-pagemap "$dir"
+		assert-block-pagemap "$dir"
 }
 
 function make_malformed_compressed_image {
@@ -555,17 +555,17 @@ function run_test_compress {
 	echo "     PASS"
 
 	# -------------------------------------------------------
-	# Test 9: region-compressed images are transformed and
-	# restored, including a final short region where present.
+	# Test 9: block-compressed images are transformed and
+	# restored, including a final short block where present.
 	# -------------------------------------------------------
-	echo "  -- Test 9: region-compressed dump -> decompress -> restore"
-	rm -rf region/
-	mkdir -p region/
-	dump_test_process region/ "--compress-region=$((page_size * 16))" > /dev/null
-	assert_region_pagemap region/
-	$CRIT decompress region/ --in-place || exit 1
-	assert_inventory_version region/ 2
-	restore_and_verify region/
+	echo "  -- Test 9: block-compressed dump -> decompress -> restore"
+	rm -rf block/
+	mkdir -p block/
+	dump_test_process block/ "--compress-block=$((page_size * 16))" > /dev/null
+	assert_block_pagemap block/
+	$CRIT decompress block/ --in-place || exit 1
+	assert_inventory_version block/ 2
+	restore_and_verify block/
 	echo "     PASS"
 
 	# -------------------------------------------------------
@@ -574,8 +574,9 @@ function run_test_compress {
 	# -------------------------------------------------------
 	echo "  -- Test 10: malformed compressed metadata is rejected"
 	local kind
-	for kind in oversize total count flags aligned-nonpresent region-limit region-count \
-			region-final-oversize; do
+	for kind in oversize total count flags aligned-nonpresent block-limit block-zero block-count \
+			block-final-oversize missing-pages-per-block missing-total-payload-size \
+			empty-blocks; do
 		local dir="malformed-$kind"
 		local before
 		local after
@@ -587,6 +588,15 @@ function run_test_compress {
 			cat "$dir.log"
 			exit 1
 		fi
+		case "$kind" in
+		missing-pages-per-block|missing-total-payload-size|empty-blocks)
+			grep -q "incomplete compression metadata" "$dir.log" || {
+				echo "FAIL: malformed $kind metadata was not rejected by validation"
+				cat "$dir.log"
+				exit 1
+			}
+			;;
+		esac
 		after=$(image_set_checksum "$dir/")
 		if [ "$before" != "$after" ]; then
 			echo "FAIL: malformed $kind image was modified"

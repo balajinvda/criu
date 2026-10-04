@@ -4,11 +4,11 @@
 
 #include "zdtmtst.h"
 
-const char *test_doc = "Check sparse incremental restore across region boundaries";
+const char *test_doc = "Check sparse incremental restore across compression block boundaries";
 const char *test_author = "Radostin Stoyanov <rstoyanov@fedoraproject.org>";
 
 #define MEM_SIZE	(64UL << 20)
-#define REGION_SIZE	(1UL << 20)
+#define BLOCK_SIZE	(1UL << 20)
 #define INITIAL_BYTE	0x11
 #define PARENT_BYTE	0x22
 #define FINAL_BYTE	0x33
@@ -24,24 +24,24 @@ static void fill_pages(char *mapping, unsigned char value, unsigned int step)
 static void update_parent_pattern(char *mapping)
 {
 	/*
-	 * Queue intermediate region 0, queue grandparent region 1, then force a
-	 * partial grandparent read with the inherited tail of region 2. Region 3
+	 * Queue intermediate block 0, queue grandparent block 1, then force a
+	 * partial grandparent read with the inherited tail of block 2. Block 3
 	 * remains available for the final image to request partially.
 	 */
-	memset(mapping, PARENT_BYTE, REGION_SIZE);
-	memset(mapping + 2 * REGION_SIZE, PARENT_BYTE, PAGE_SIZE);
-	memset(mapping + 3 * REGION_SIZE, PARENT_BYTE, REGION_SIZE);
+	memset(mapping, PARENT_BYTE, BLOCK_SIZE);
+	memset(mapping + 2 * BLOCK_SIZE, PARENT_BYTE, PAGE_SIZE);
+	memset(mapping + 3 * BLOCK_SIZE, PARENT_BYTE, BLOCK_SIZE);
 }
 
 static void update_final_pattern(char *mapping)
 {
 	/*
-	 * The final image owns one page of intermediate region 3. Restoring its
+	 * The final image owns one page of intermediate block 3. Restoring its
 	 * inherited tail first flushes encoded work queued in both parent readers.
 	 * Without one context for the complete chain, those readers retain both
 	 * batch permits and the final reader deadlocks acquiring a third.
 	 */
-	memset(mapping + 3 * REGION_SIZE, FINAL_BYTE, PAGE_SIZE);
+	memset(mapping + 3 * BLOCK_SIZE, FINAL_BYTE, PAGE_SIZE);
 }
 
 static int verify_pages(const char *mapping, unsigned int generation)
@@ -49,15 +49,15 @@ static int verify_pages(const char *mapping, unsigned int generation)
 	size_t page;
 
 	for (page = 0; page < MEM_SIZE / PAGE_SIZE; page++) {
-		bool in_parent_region = page < REGION_SIZE / PAGE_SIZE ||
-			page == 2 * REGION_SIZE / PAGE_SIZE ||
-			(page >= 3 * REGION_SIZE / PAGE_SIZE &&
-			 page < 4 * REGION_SIZE / PAGE_SIZE);
-		unsigned char value = generation && in_parent_region ?
+		bool in_parent_block = page < BLOCK_SIZE / PAGE_SIZE ||
+			page == 2 * BLOCK_SIZE / PAGE_SIZE ||
+			(page >= 3 * BLOCK_SIZE / PAGE_SIZE &&
+			 page < 4 * BLOCK_SIZE / PAGE_SIZE);
+		unsigned char value = generation && in_parent_block ?
 			PARENT_BYTE : INITIAL_BYTE;
 		size_t byte;
 
-		if (generation > 1 && page == 3 * REGION_SIZE / PAGE_SIZE)
+		if (generation > 1 && page == 3 * BLOCK_SIZE / PAGE_SIZE)
 			value = FINAL_BYTE;
 
 		for (byte = 0; byte < PAGE_SIZE; byte++) {

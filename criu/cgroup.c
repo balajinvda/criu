@@ -26,8 +26,12 @@
 #include "protobuf.h"
 #include "images/core.pb-c.h"
 #include "images/cgroup.pb-c.h"
+#include <sys/syscall.h>
 #include "kerndat.h"
+#include "fs-magic.h"
+#include "mount-v2.h"
 #include "linux/mount.h"
+#include "fault-injection.h"
 
 /*
  * This structure describes set of controller groups
@@ -624,12 +628,87 @@ err:
 	return -1;
 }
 
+static int has_root_cgroupv2 = -1;
+
+static bool has_root_cgroupv2_mount(void)
+{
+	union {
+		struct cr_statmount sm;
+		char buf[sizeof(struct cr_statmount) + 64];
+	} smbuf = {};
+	struct cr_statx stx = {};
+	struct cr_mnt_id_req req = {
+		.size = MNT_ID_REQ_SIZE_VER1,
+		.param = STATMOUNT_SB_BASIC | STATMOUNT_MNT_ROOT,
+	};
+	int ret;
+
+	if (has_root_cgroupv2 >= 0)
+		return has_root_cgroupv2;
+
+	has_root_cgroupv2 = 0;
+	if (!kdat.has_statmount)
+		return false;
+
+	if (fault_injected(FI_CGROUP2_NO_ROOT_MOUNT))
+		return false;
+
+	if (!(kdat.statmount_supported_mask & STATMOUNT_MNT_ROOT) ||
+	    !(kdat.statmount_supported_mask & STATMOUNT_SB_BASIC))
+		return false;
+
+	ret = syscall(SYS_statx, AT_FDCWD, SYS_FS_CGROUP_PATH, 0, STATX_MNT_ID_UNIQUE, &stx);
+	if (ret < 0) {
+		pr_debug("statx(%s) failed: %s\n", SYS_FS_CGROUP_PATH, strerror(errno));
+		return false;
+	}
+
+	if (!(stx.stx_mask & STATX_MNT_ID_UNIQUE) ||
+	    !(stx.stx_attributes_mask & STATX_ATTR_MOUNT_ROOT))
+		return false;
+
+	if (!(stx.stx_attributes & STATX_ATTR_MOUNT_ROOT))
+		goto out;
+
+	req.mnt_id = stx.stx_mnt_id;
+
+	if (sys_statmount(&req, &smbuf.sm, sizeof(smbuf), 0)) {
+		if (errno == EOVERFLOW)
+			goto out;
+		pr_debug("statmount(%s) failed: %s\n", SYS_FS_CGROUP_PATH, strerror(errno));
+		return false;
+	}
+
+	if ((smbuf.sm.mask & (STATMOUNT_SB_BASIC | STATMOUNT_MNT_ROOT)) ==
+	    (STATMOUNT_SB_BASIC | STATMOUNT_MNT_ROOT)) {
+		const char *mnt_root = smbuf.sm.str + smbuf.sm.mnt_root;
+
+		if (smbuf.sm.sb_magic == CGROUP2_SUPER_MAGIC && !strcmp(mnt_root, "/"))
+			has_root_cgroupv2 = 1;
+	}
+
+out:
+	pr_info("%s %s the root cgroupv2 mount\n",
+		SYS_FS_CGROUP_PATH,
+		has_root_cgroupv2 ? "is" : "is not");
+
+	return has_root_cgroupv2;
+}
+
 static int open_cgroupfs(struct cg_ctl *cc)
 {
 	const char *fstype = cc->name[0] == 0 ? "cgroup2" : "cgroup";
 	char prefix[] = ".criu.cgmounts.XXXXXX";
 	char mopts[1024];
 	int fd;
+
+	if (cc->name[0] == 0 && has_root_cgroupv2_mount()) {
+		fd = sys_open_tree(AT_FDCWD, SYS_FS_CGROUP_PATH, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+		if (fd >= 0)
+			return fd;
+		pr_perror("Unable to open tree %s, falling back to mounting cgroup2", SYS_FS_CGROUP_PATH);
+		has_root_cgroupv2 = 0;
+	}
 
 	if (kdat.has_fsopen)
 		return __new_open_cgroupfs(cc);
@@ -1305,12 +1384,45 @@ static int move_in_cgroup(CgSetEntry *se)
 	return 0;
 }
 
+static bool has_cgns_prefix(CgSetEntry *se)
+{
+	int i;
+
+	for (i = 0; i < se->n_ctls; i++)
+		if (se->ctls[i]->has_cgns_prefix)
+			return true;
+
+	return false;
+}
+
+/*
+ * In the CG_MODE_IGNORE mode we do not deal with cgroups at all, relying
+ * on the caller (e.g. a container runtime) to have placed us into the
+ * proper cgroup, which the restored tasks inherit.
+ *
+ * A cgroup namespace, though, can not be set up by the caller: unshare()
+ * pins the namespace root to the cgroup of the calling task, so it has to
+ * be done by the very process the restored tasks are forked from, i.e.
+ * here. As the caller has already put us into the right cgroup, no moving
+ * around is needed -- a plain unshare() is sufficient.
+ */
+static int prepare_cgns_ignore(CgSetEntry *se)
+{
+	if (!has_cgns_prefix(se))
+		return 0;
+
+	pr_info("Creating cgns rooted at the current cgroup\n");
+	if (unshare(CLONE_NEWCGROUP) < 0) {
+		pr_perror("couldn't unshare cgns");
+		return -1;
+	}
+
+	return 0;
+}
+
 int prepare_cgroup_namespace(struct pstree_item *root_task)
 {
 	CgSetEntry *se;
-
-	if (opts.manage_cgroups == CG_MODE_IGNORE)
-		return 0;
 
 	if (root_task->parent) {
 		pr_err("Expecting root_task to restore cgroup namespace\n");
@@ -1333,6 +1445,9 @@ int prepare_cgroup_namespace(struct pstree_item *root_task)
 		pr_err("No set %d found\n", rsti(root_task)->cg_set);
 		return -1;
 	}
+
+	if (opts.manage_cgroups == CG_MODE_IGNORE)
+		return prepare_cgns_ignore(se);
 
 	if (prepare_cgns(se) < 0) {
 		pr_err("failed preparing cgns\n");
@@ -1452,12 +1567,37 @@ static int restore_cgroup_subtree_control(const CgroupPropEntry *cg_prop_entry_p
 	return 0;
 }
 
+/* Append "/dir_name" to path at offset off, checking that it fits in a buffer
+ * of path_size bytes. On success, if new_off is not NULL, it is set to the
+ * offset of the resulting string's terminating null byte.
+ */
+static int append_cgroup_dir(char *path, size_t path_size, size_t off, const char *dir_name, size_t *new_off)
+{
+	int ret;
+
+	if (off >= path_size) {
+		pr_err("Cgroup path '%.*s' is too long\n", path_size > 0 ? (int)path_size - 1 : 0, path);
+		return -1;
+	}
+
+	ret = snprintf(path + off, path_size - off, "/%s", dir_name);
+	if (ret < 0 || (size_t)ret >= path_size - off) {
+		pr_err("Cgroup path %.*s/%s is too long\n", (int)off, path, dir_name);
+		return -1;
+	}
+
+	if (new_off)
+		*new_off = off + ret;
+	return 0;
+}
+
 /*
  * Note: The path string can be modified in this function,
- * the length of path string should be at least PATH_MAX.
+ * the buffer holding it must be at least path_size bytes.
  */
-static int restore_cgroup_prop(const CgroupPropEntry *cg_prop_entry_p, char *path, int off, bool split_lines,
-			       bool skip_fails)
+static int restore_cgroup_prop(const CgroupPropEntry *cg_prop_entry_p,
+			       char *path, size_t path_size, size_t off,
+			       bool split_lines, bool skip_fails)
 {
 	int cg, fd, exit_code = -1, flag;
 	CgroupPerms *perms = cg_prop_entry_p->perms;
@@ -1471,10 +1611,8 @@ static int restore_cgroup_prop(const CgroupPropEntry *cg_prop_entry_p, char *pat
 		return -1;
 	}
 
-	if (snprintf(path + off, PATH_MAX - off, "/%s", cg_prop_entry_p->name) >= PATH_MAX) {
-		pr_err("snprintf output was truncated for %s\n", cg_prop_entry_p->name);
+	if (append_cgroup_dir(path, path_size, off, cg_prop_entry_p->name, NULL))
 		return -1;
-	}
 
 	pr_info("Restoring cgroup property value [%s] to [%s]\n", cg_prop_entry_p->value, path);
 
@@ -1563,7 +1701,7 @@ int restore_freezer_state(void)
 		return 0;
 
 	freezer_path_len = strlen(freezer_path);
-	return restore_cgroup_prop(freezer_state_entry, freezer_path, freezer_path_len, false, false);
+	return restore_cgroup_prop(freezer_state_entry, freezer_path, sizeof(freezer_path), freezer_path_len, false, false);
 }
 
 static void add_freezer_state_for_restore(CgroupPropEntry *entry, char *path, size_t path_len)
@@ -1638,7 +1776,7 @@ static int filter_ifpriomap(char *out, char *line)
 	return 0;
 }
 
-static int restore_cgroup_ifpriomap(CgroupPropEntry *cpe, char *path, int off)
+static int restore_cgroup_ifpriomap(CgroupPropEntry *cpe, char *path, size_t path_size, size_t off)
 {
 	CgroupPropEntry priomap = *cpe;
 	int ret = -1;
@@ -1650,7 +1788,7 @@ static int restore_cgroup_ifpriomap(CgroupPropEntry *cpe, char *path, int off)
 		goto out;
 
 	if (strlen(priomap.value))
-		ret = restore_cgroup_prop(&priomap, path, off, true, true);
+		ret = restore_cgroup_prop(&priomap, path, path_size, off, true, true);
 	else
 		ret = 0;
 
@@ -1659,7 +1797,7 @@ out:
 	return ret;
 }
 
-static int prepare_cgroup_dir_properties(char *path, int off, CgroupDirEntry **ents, unsigned int n_ents)
+static int prepare_cgroup_dir_properties(char *path, size_t path_size, size_t off, CgroupDirEntry **ents, unsigned int n_ents)
 {
 	unsigned int i, j;
 
@@ -1670,7 +1808,8 @@ static int prepare_cgroup_dir_properties(char *path, int off, CgroupDirEntry **e
 		if (strcmp(e->dir_name, "") == 0)
 			goto skip; /* skip root cgroups */
 
-		off2 += sprintf(path + off, "/%s", e->dir_name);
+		if (append_cgroup_dir(path, path_size, off, e->dir_name, &off2) < 0)
+			return -1;
 		for (j = 0; j < e->n_properties; ++j) {
 			CgroupPropEntry *p = e->properties[j];
 
@@ -1692,16 +1831,16 @@ static int prepare_cgroup_dir_properties(char *path, int off, CgroupDirEntry **e
 			 * Number of network interfaces on host may differ.
 			 */
 			if (strcmp(p->name, "net_prio.ifpriomap") == 0) {
-				if (restore_cgroup_ifpriomap(p, path, off2))
+				if (restore_cgroup_ifpriomap(p, path, path_size, off2))
 					return -1;
 				continue;
 			}
 
-			if (restore_cgroup_prop(p, path, off2, false, false) < 0)
+			if (restore_cgroup_prop(p, path, path_size, off2, false, false) < 0)
 				return -1;
 		}
 	skip:
-		if (prepare_cgroup_dir_properties(path, off2, e->children, e->n_children) < 0)
+		if (prepare_cgroup_dir_properties(path, path_size, off2, e->children, e->n_children) < 0)
 			return -1;
 	}
 
@@ -1725,7 +1864,7 @@ int prepare_cgroup_properties(void)
 		off = ctrl_dir_and_opt(c, cname_path, sizeof(cname_path), NULL, 0);
 		if (off < 0)
 			return -1;
-		if (prepare_cgroup_dir_properties(cname_path, off, c->dirs, c->n_dirs) < 0)
+		if (prepare_cgroup_dir_properties(cname_path, sizeof(cname_path), off, c->dirs, c->n_dirs) < 0)
 			return -1;
 	}
 
@@ -1742,7 +1881,7 @@ int prepare_cgroup_properties(void)
  * Further, we must have a write() call for each line, because the kernel
  * only parses the first line of any write().
  */
-static int restore_devices_list(char *paux, size_t off, CgroupPropEntry *pr)
+static int restore_devices_list(char *paux, size_t paux_size, size_t off, CgroupPropEntry *pr)
 {
 	CgroupPropEntry dev_allow = *pr;
 	CgroupPropEntry dev_deny = *pr;
@@ -1752,7 +1891,7 @@ static int restore_devices_list(char *paux, size_t off, CgroupPropEntry *pr)
 	dev_deny.name = "devices.deny";
 	dev_deny.value = "a";
 
-	ret = restore_cgroup_prop(&dev_deny, paux, off, false, false);
+	ret = restore_cgroup_prop(&dev_deny, paux, paux_size, off, false, false);
 
 	/*
 	 * An empty string here means nothing is allowed,
@@ -1765,10 +1904,10 @@ static int restore_devices_list(char *paux, size_t off, CgroupPropEntry *pr)
 	if (ret < 0)
 		return -1;
 
-	return restore_cgroup_prop(&dev_allow, paux, off, true, false);
+	return restore_cgroup_prop(&dev_allow, paux, paux_size, off, true, false);
 }
 
-static int restore_special_property(char *paux, size_t off, CgroupPropEntry *pr)
+static int restore_special_property(char *paux, size_t paux_size, size_t off, CgroupPropEntry *pr)
 {
 	/*
 	 * XXX: we can drop this hack and make memory.swappiness and
@@ -1788,13 +1927,13 @@ static int restore_special_property(char *paux, size_t off, CgroupPropEntry *pr)
 		 * restore all of this stuff.
 		 */
 		pr->perms->mode = 0200;
-		return restore_devices_list(paux, off, pr);
+		return restore_devices_list(paux, paux_size, off, pr);
 	}
 
-	return restore_cgroup_prop(pr, paux, off, false, false);
+	return restore_cgroup_prop(pr, paux, paux_size, off, false, false);
 }
 
-static int restore_special_props(char *paux, size_t off, CgroupDirEntry *e)
+static int restore_special_props(char *paux, size_t paux_size, size_t off, CgroupDirEntry *e)
 {
 	unsigned int j;
 
@@ -1806,7 +1945,7 @@ static int restore_special_props(char *paux, size_t off, CgroupDirEntry *e)
 		if (!is_special_property(prop->name))
 			continue;
 
-		if (restore_special_property(paux, off, prop) < 0) {
+		if (restore_special_property(paux, paux_size, off, prop) < 0) {
 			pr_err("Restoring %s special property failed\n", prop->name);
 			return -1;
 		}
@@ -1831,8 +1970,8 @@ static int prepare_dir_perms(int cg, char *path, CgroupPerms *perms)
 	return ret;
 }
 
-static int prepare_cgroup_dirs(char **controllers, int n_controllers, char *paux, size_t off, CgroupDirEntry **ents,
-			       size_t n_ents)
+static int prepare_cgroup_dirs(char **cnames, int n_cnames, char *paux, size_t paux_size, size_t off,
+			       CgroupDirEntry **ents, size_t n_ents)
 {
 	size_t i, j;
 	CgroupDirEntry *e;
@@ -1842,7 +1981,8 @@ static int prepare_cgroup_dirs(char **controllers, int n_controllers, char *paux
 		size_t off2 = off;
 		e = ents[i];
 
-		off2 += sprintf(paux + off, "/%s", e->dir_name);
+		if (append_cgroup_dir(paux, paux_size, off, e->dir_name, &off2) < 0)
+			return -1;
 
 		if (faccessat(cg, paux, F_OK, 0) < 0) {
 			if (errno != ENOENT) {
@@ -1864,8 +2004,8 @@ static int prepare_cgroup_dirs(char **controllers, int n_controllers, char *paux
 			if (prepare_dir_perms(cg, paux, e->dir_perms) < 0)
 				return -1;
 
-			for (j = 0; j < n_controllers; j++) {
-				if (restore_special_props(paux, off2, e) < 0) {
+			for (j = 0; j < n_cnames; j++) {
+				if (restore_special_props(paux, paux_size, off2, e) < 0) {
 					pr_err("Restoring special cpuset props failed!\n");
 					return -1;
 				}
@@ -1891,7 +2031,7 @@ static int prepare_cgroup_dirs(char **controllers, int n_controllers, char *paux
 				return -1;
 		}
 
-		if (prepare_cgroup_dirs(controllers, n_controllers, paux, off2, e->children, e->n_children) < 0)
+		if (prepare_cgroup_dirs(cnames, n_cnames, paux, paux_size, off2, e->children, e->n_children) < 0)
 			return -1;
 	}
 
@@ -1927,7 +2067,11 @@ static int prepare_cgroup_sfd(CgroupEntry *ce)
 	pr_info("Preparing cgroups yard (cgroups restore mode %#x)\n", opts.manage_cgroups);
 
 	if (opts.cgroup_yard) {
-		off = sprintf(paux, "%s", opts.cgroup_yard);
+		off = snprintf(paux, sizeof(paux), "%s", opts.cgroup_yard);
+		if (off < 0 || off >= sizeof(paux) - 1) {
+			pr_err("Cgroup yard path %s is too long\n", opts.cgroup_yard);
+			return -1;
+		}
 
 		cg_yard = xstrdup(paux);
 		if (!cg_yard)
@@ -1964,6 +2108,7 @@ static int prepare_cgroup_sfd(CgroupEntry *ce)
 
 	for (i = 0; i < ce->n_controllers; i++) {
 		int ctl_off = off, yard_off;
+		size_t yard_size;
 		char opt[128], *yard;
 		CgControllerEntry *ctrl = ce->controllers[i];
 
@@ -1998,10 +2143,15 @@ static int prepare_cgroup_sfd(CgroupEntry *ce)
 		/*
 		 * Finally handle all cgroups for this controller.
 		 */
-		yard = paux + strlen(cg_yard) + 1;
-		yard_off = ctl_off - (strlen(cg_yard) + 1);
+		yard = paux + off;
+		yard_off = ctl_off - off;
+		if (yard_off < 0) {
+			pr_err("Invalid cgroup yard offset %d\n", yard_off);
+			return -1;
+		}
+		yard_size = sizeof(paux) - off;
 		if (opts.manage_cgroups &&
-		    prepare_cgroup_dirs(ctrl->cnames, ctrl->n_cnames, yard, yard_off, ctrl->dirs, ctrl->n_dirs))
+		    prepare_cgroup_dirs(ctrl->cnames, ctrl->n_cnames, yard, yard_size, yard_off, ctrl->dirs, ctrl->n_dirs))
 			return -1;
 	}
 

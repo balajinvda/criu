@@ -7,9 +7,8 @@ options across different memory workload patterns.
 
 Compression modes:
   uncompressed - No compression
-  lz4-page    - Each host page compressed as its own LZ4 block
-  lz4-region  - N consecutive pages compressed as a single LZ4 block
-                (region size set via --region-sizes)
+  lz4-block   - Consecutive pages compressed as LZ4 blocks
+                (block size set via --block-sizes)
 
 Workload patterns (defined in workload.py):
   zero    - All pages zero-filled (best case: highly compressible)
@@ -24,7 +23,7 @@ Methodology:
   - Page cache is dropped between runs for consistent IO
   - Results show the median of measured iterations
   - Memory integrity validated via SHA-256 after each restore
-  - For LZ4 region compression the benchmark sweeps multiple region sizes by
+  - For LZ4 block compression the benchmark sweeps multiple block sizes by
     default to expose the size/ratio/throughput tradeoff.
 
 Usage:
@@ -32,8 +31,8 @@ Usage:
   sudo python3 contrib/compression-benchmark/main.py -n 5 -s 512
   sudo python3 contrib/compression-benchmark/main.py -p zero mixed random
   sudo python3 contrib/compression-benchmark/main.py \\
-       --modes uncompressed lz4-page lz4-region \\
-       --region-sizes 65536 262144 1048576
+       --modes uncompressed lz4-block \\
+       --block-sizes 4096 65536 262144 1048576
 """
 
 import argparse
@@ -56,7 +55,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import workload  # noqa: E402
 
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-MAX_REGION_SIZE = 4 * 1024 * 1024
+MAX_BLOCK_SIZE = 4 * 1024 * 1024
 MAX_COMPRESSION_ACCELERATION = 65537
 MAX_DECOMPRESSION_THREADS = 1024
 CHECKSUM_TIMEOUT = 60
@@ -64,6 +63,18 @@ WORKLOAD_START_MIN_TIMEOUT = 30
 WORKLOAD_START_MIN_RATE = 64 * 1024 * 1024
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKLOAD_PATH = os.path.join(SCRIPT_DIR, "workload.py")
+
+
+def default_block_sizes(page_size):
+    candidates = (page_size, 64 * 1024, 256 * 1024, 1024 * 1024)
+    return list(dict.fromkeys(
+        size for size in candidates
+        if size <= MAX_BLOCK_SIZE and size % page_size == 0
+    ))
+
+
+DEFAULT_BLOCK_SIZES = default_block_sizes(PAGE_SIZE)
+
 
 PATTERN_DESCRIPTIONS = {
     "zero": "All pages zero-filled; highly compressible",
@@ -399,12 +410,10 @@ def stop_workload(pid):
 # --- Trial ---
 
 def cfg_label(cfg):
-    """Short, stable label for a (mode, region_size) pair."""
+    """Short, stable label for a (mode, block_size) pair."""
     if cfg["mode"] == "uncompressed":
         return "Uncompressed"
-    if cfg["mode"] == "lz4-page":
-        return f"LZ4 per page ({PAGE_SIZE // 1024} KiB blocks)"
-    return f"LZ4 regions ({cfg['region_size']//1024} KiB blocks)"
+    return f"LZ4 blocks ({cfg['block_size']//1024} KiB)"
 
 
 def run_trial(pattern, size, cfg, workdir, expect):
@@ -421,10 +430,8 @@ def run_trial(pattern, size, cfg, workdir, expect):
         cmd = [_runtime.criu_bin, "--no-default-config", "dump", "-t", str(pid),
                "-D", imgdir, "--shell-job", "-v0", "-o", "dump.log"]
         mode = cfg["mode"]
-        if mode == "lz4-page":
-            cmd += ["-c"]
-        elif mode == "lz4-region":
-            cmd += ["--compress-region", str(cfg["region_size"])]
+        if mode == "lz4-block":
+            cmd += ["--compress-block", str(cfg["block_size"])]
         if mode != "uncompressed" and _runtime.compress_acceleration != 1:
             cmd += ["--compress-acceleration",
                     str(_runtime.compress_acceleration)]
@@ -678,13 +685,14 @@ def main():
                     choices=workload.supported_patterns(),
                     help="Data patterns to test (default: all)")
     ap.add_argument("--modes", nargs="+",
-                    default=["uncompressed", "lz4-page", "lz4-region"],
-                    choices=["uncompressed", "lz4-page", "lz4-region"],
-                    help="Compression modes to compare (default: all three)")
-    ap.add_argument("--region-sizes", nargs="+", type=int,
-                    default=[65536, 262144, 1048576],
-                    help="Region sizes (bytes) to sweep when --modes contains "
-                         "lz4-region (default: 64K 256K 1M)")
+                    default=["uncompressed", "lz4-block"],
+                    choices=["uncompressed", "lz4-block"],
+                    help="Compression modes to compare (default: both)")
+    ap.add_argument("--block-sizes", nargs="+", type=int,
+                    default=DEFAULT_BLOCK_SIZES,
+                    help="Block sizes (bytes) to sweep when --modes contains "
+                         "lz4-block (default: page size and supported values "
+                         "among 64K, 256K, and 1M)")
     ap.add_argument("--compress-acceleration", type=int, default=1,
                     help="LZ4 acceleration level (default: 1, higher=faster)")
     ap.add_argument("--decompress-threads", type=int, default=None,
@@ -712,14 +720,14 @@ def main():
             not 0 <= args.decompress_threads <= MAX_DECOMPRESSION_THREADS:
         ap.error("--decompress-threads must be between 0 and "
                  f"{MAX_DECOMPRESSION_THREADS}")
-    if any(size <= 0 or size > MAX_REGION_SIZE or size % PAGE_SIZE
-           for size in args.region_sizes):
-        ap.error(f"--region-sizes must be positive multiples of {PAGE_SIZE} "
-                 f"not exceeding {MAX_REGION_SIZE}")
+    if any(size <= 0 or size > MAX_BLOCK_SIZE or size % PAGE_SIZE
+           for size in args.block_sizes):
+        ap.error(f"--block-sizes must be positive multiples of {PAGE_SIZE} "
+                 f"not exceeding {MAX_BLOCK_SIZE}")
     if len(args.modes) != len(set(args.modes)):
         ap.error("--modes must not contain duplicate values")
-    if len(args.region_sizes) != len(set(args.region_sizes)):
-        ap.error("--region-sizes must not contain duplicate values")
+    if len(args.block_sizes) != len(set(args.block_sizes)):
+        ap.error("--block-sizes must not contain duplicate values")
     _runtime.criu_bin = args.criu
     _runtime.compress_acceleration = args.compress_acceleration
     _runtime.decompress_threads = args.decompress_threads
@@ -739,14 +747,14 @@ def main():
         signal.signal(handled, _sighandler)
     atexit.register(_cleanup)
 
-    # Build the configuration matrix: each entry is a dict {mode, region_size}.
+    # Build the configuration matrix: each entry is a dict {mode, block_size}.
     cfgs = []
     for m in args.modes:
-        if m == "lz4-region":
-            for rs in args.region_sizes:
-                cfgs.append({"mode": "lz4-region", "region_size": rs})
+        if m == "lz4-block":
+            for bs in args.block_sizes:
+                cfgs.append({"mode": "lz4-block", "block_size": bs})
         else:
-            cfgs.append({"mode": m, "region_size": 0})
+            cfgs.append({"mode": m, "block_size": 0})
     cfg_labels = [cfg_label(c) for c in cfgs]
 
     info = collect_system_info()
@@ -827,7 +835,7 @@ def main():
                        "config": {"iterations": args.iterations,
                                   "size_mb": args.size,
                                   "modes": cfg_labels,
-                                  "region_sizes": args.region_sizes,
+                                  "block_sizes": args.block_sizes,
                                   "compress_acceleration":
                                       args.compress_acceleration,
                                   "decompress_threads":

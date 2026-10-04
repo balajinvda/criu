@@ -30,9 +30,7 @@ def check_raw_entry(directory, pid):
 
         is_raw_target = (
             int(entry.get("nr_pages", 0)) == 56
-            and "compressed_size" not in entry
-            and "total_compressed_size" not in entry
-            and "region_pages" not in entry
+            and "blocks" not in entry
         )
         if is_raw_target:
             if not flags & PE_PAYLOAD_ALIGNED:
@@ -46,16 +44,16 @@ def check_raw_entry(directory, pid):
                 return 1
             found = True
 
-        compressed_sizes = entry.get("compressed_size")
-        if compressed_sizes:
-            block_pages = int(entry.get("region_pages", 0)) or 1
+        blocks = entry.get("blocks")
+        if blocks and blocks.get("block_sizes"):
+            block_pages = int(blocks.get("pages_per_block", 1))
             remaining = int(entry.get("nr_pages", 0))
-            for size in compressed_sizes:
+            for size in blocks["block_sizes"]:
                 pages = min(block_pages, remaining)
                 if 0 < int(size) < pages * page_size:
                     found_lz4 = True
                 remaining -= pages
-            payload_offset += sum(int(size) for size in compressed_sizes)
+            payload_offset += int(blocks.get("total_payload_size", sum(int(size) for size in blocks["block_sizes"])))
         else:
             payload_offset += int(entry.get("nr_pages", 0)) * page_size
 

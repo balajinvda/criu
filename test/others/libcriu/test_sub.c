@@ -71,11 +71,11 @@ int main(int argc, char **argv)
 	fd = open(argv[2], O_DIRECTORY);
 	criu_set_images_dir_fd(fd);
 	if (getenv("CRIU_FEATURE_COMPRESS")) {
-		if (criu_set_compress_region_size(64 * 1024 + 1) != -EINVAL ||
-		    criu_set_compress_region_size(64 * 1024) ||
-		    criu_set_compress(CRIU_COMPRESS_PER_PAGE) ||
+		if (criu_set_compress_block_size(64 * 1024 + 1) != -EINVAL ||
+		    criu_set_compress_block_size(64 * 1024) ||
+		    criu_set_compress(CRIU_COMPRESS_BLOCK) ||
 		    criu_set_compress_acceleration(2) ||
-		    criu_set_compress_region_size(64 * 1024)) {
+		    criu_set_compress_block_size(64 * 1024)) {
 			fprintf(stderr, "Failed to configure memory compression\n");
 			kill(pid, SIGKILL);
 			goto err;

@@ -3,6 +3,7 @@
 #include <string.h>
 #include <assert.h>
 #include <dirent.h>
+#include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sched.h>
@@ -15,8 +16,232 @@
 #include "compression.h"
 #include "page.h"
 #include "pagemap.h"
+#include "cr_options.h"
+#include "plugin.h"
 
 int parse_statement(int i, char *line, char **configuration);
+
+cr_plugin_ctl_t cr_plugin_ctl;
+
+#define TEST_PLUGIN_HANDLERS 4
+
+static int test_plugin_results[TEST_PLUGIN_HANDLERS];
+static unsigned int test_plugin_order[TEST_PLUGIN_HANDLERS];
+static unsigned int test_plugin_calls;
+
+static int test_plugin_hook(unsigned int index, int id)
+{
+	assert(id == 42);
+	assert(test_plugin_calls < TEST_PLUGIN_HANDLERS);
+	test_plugin_order[test_plugin_calls++] = index;
+	return test_plugin_results[index];
+}
+
+static int test_plugin_hook_0(int id)
+{
+	return test_plugin_hook(0, id);
+}
+
+static int test_plugin_hook_1(int id)
+{
+	return test_plugin_hook(1, id);
+}
+
+static int test_plugin_hook_2(int id)
+{
+	return test_plugin_hook(2, id);
+}
+
+static int test_plugin_hook_3(int id)
+{
+	return test_plugin_hook(3, id);
+}
+
+static cr_plugin_desc_t test_plugin_descs[TEST_PLUGIN_HANDLERS] = {
+	{
+		.name = "test-plugin-0",
+		.max_hooks = CR_PLUGIN_HOOK__MAX,
+		.hooks[CR_PLUGIN_HOOK__DUMP_DEVICES_LATE] = (void *)test_plugin_hook_0,
+	},
+	{
+		.name = "test-plugin-1",
+		.max_hooks = CR_PLUGIN_HOOK__MAX,
+		.hooks[CR_PLUGIN_HOOK__DUMP_DEVICES_LATE] = (void *)test_plugin_hook_1,
+	},
+	{
+		.name = "test-plugin-2",
+		.max_hooks = CR_PLUGIN_HOOK__MAX,
+		.hooks[CR_PLUGIN_HOOK__DUMP_DEVICES_LATE] = (void *)test_plugin_hook_2,
+	},
+	{
+		.name = "test-plugin-3",
+		.max_hooks = CR_PLUGIN_HOOK__MAX,
+		.hooks[CR_PLUGIN_HOOK__DUMP_DEVICES_LATE] = (void *)test_plugin_hook_3,
+	},
+};
+
+static plugin_desc_t test_plugins[TEST_PLUGIN_HANDLERS];
+
+static void prepare_plugin_chain(void)
+{
+	unsigned int i;
+
+	INIT_LIST_HEAD(&cr_plugin_ctl.hook_chain[CR_PLUGIN_HOOK__DUMP_DEVICES_LATE]);
+	test_plugin_calls = 0;
+	for (i = 0; i < TEST_PLUGIN_HANDLERS; i++) {
+		test_plugins[i].d = &test_plugin_descs[i];
+		INIT_LIST_HEAD(&test_plugins[i].link[CR_PLUGIN_HOOK__DUMP_DEVICES_LATE]);
+		list_add_tail(&test_plugins[i].link[CR_PLUGIN_HOOK__DUMP_DEVICES_LATE],
+			      &cr_plugin_ctl.hook_chain[CR_PLUGIN_HOOK__DUMP_DEVICES_LATE]);
+	}
+}
+
+static void assert_plugin_order(void)
+{
+	unsigned int i;
+
+	assert(test_plugin_calls == TEST_PLUGIN_HANDLERS);
+	for (i = 0; i < TEST_PLUGIN_HANDLERS; i++)
+		assert(test_plugin_order[i] == i);
+}
+
+static void test_plugin_dispatch_all(void)
+{
+	unsigned int i;
+
+	INIT_LIST_HEAD(&cr_plugin_ctl.hook_chain[CR_PLUGIN_HOOK__DUMP_DEVICES_LATE]);
+	assert(run_plugins_all(DUMP_DEVICES_LATE, 42) == -ENOTSUP);
+
+	prepare_plugin_chain();
+	for (i = 0; i < TEST_PLUGIN_HANDLERS; i++)
+		test_plugin_results[i] = -ENOTSUP;
+	assert(run_plugins_all(DUMP_DEVICES_LATE, 42) == -ENOTSUP);
+	assert_plugin_order();
+
+	prepare_plugin_chain();
+	test_plugin_results[0] = 0;
+	test_plugin_results[1] = -ENOTSUP;
+	test_plugin_results[2] = 0;
+	test_plugin_results[3] = -ENOTSUP;
+	assert(run_plugins_all(DUMP_DEVICES_LATE, 42) == 0);
+	assert_plugin_order();
+
+	prepare_plugin_chain();
+	test_plugin_results[0] = 0;
+	test_plugin_results[1] = -ENOTSUP;
+	test_plugin_results[2] = -EINVAL;
+	test_plugin_results[3] = -EIO;
+	assert(run_plugins_all(DUMP_DEVICES_LATE, 42) == -EINVAL);
+	assert_plugin_order();
+
+	prepare_plugin_chain();
+	test_plugin_results[0] = -EPERM;
+	test_plugin_results[1] = 0;
+	test_plugin_results[2] = -EIO;
+	test_plugin_results[3] = -ENOTSUP;
+	assert(run_plugins_all(DUMP_DEVICES_LATE, 42) == -EPERM);
+	assert_plugin_order();
+
+	prepare_plugin_chain();
+	test_plugin_results[0] = -ENOTSUP;
+	test_plugin_results[1] = 7;
+	test_plugin_results[2] = -EIO;
+	test_plugin_results[3] = 0;
+	assert(run_plugins_all(DUMP_DEVICES_LATE, 42) == 7);
+	assert_plugin_order();
+}
+
+static void test_plugin_options(void)
+{
+	bool usage_error = true;
+	bool has_exec_cmd = false;
+	char **plugin_argv;
+	int plugin_argc;
+	char *argv[] = {
+		(char *)"criu",
+		(char *)"--no-default-config",
+		(char *)"--plugin-option",
+		(char *)"example.option=first",
+		(char *)"check",
+		NULL,
+	};
+	assert(init_opts() == 0);
+	assert(parse_options(5, argv, &usage_error, &has_exec_cmd, PARSING_GLOBAL_CONF) == 0);
+	assert(criu_plugin_get_options(&plugin_argc, &plugin_argv) == 0);
+	assert(plugin_argc == 2);
+	assert(!strcmp(plugin_argv[0], "criu-plugin"));
+	assert(!strcmp(plugin_argv[1], "--example.option=first"));
+	assert(plugin_argv[2] == NULL);
+	cr_plugin_options_clear();
+
+	assert(cr_plugin_option_add_arg("example.option=first") == 0);
+	assert(cr_plugin_option_add_arg("example.option=second") == 0);
+	assert(cr_plugin_option_add_arg("example.empty=") == 0);
+	assert(cr_plugin_option_add_arg("example.equals=left=right") == 0);
+	assert(criu_plugin_get_options(&plugin_argc, &plugin_argv) == 0);
+	assert(plugin_argc == 5);
+	assert(!strcmp(plugin_argv[1], "--example.option=first"));
+	assert(!strcmp(plugin_argv[2], "--example.option=second"));
+	assert(!strcmp(plugin_argv[3], "--example.empty="));
+	assert(!strcmp(plugin_argv[4], "--example.equals=left=right"));
+	assert(plugin_argv[5] == NULL);
+	cr_plugin_options_clear();
+
+	assert(cr_plugin_option_add_arg("example.option=config") == 0);
+	cr_plugin_default_options_parsed();
+	assert(cr_plugin_option_add_arg("example.option=request") == 0);
+	assert(criu_plugin_get_options(&plugin_argc, &plugin_argv) == 0);
+	assert(plugin_argc == 3);
+	assert(!strcmp(plugin_argv[1], "--example.option=config"));
+	assert(!strcmp(plugin_argv[2], "--example.option=request"));
+
+	cr_plugin_options_clear_request();
+	assert(criu_plugin_get_options(&plugin_argc, &plugin_argv) == 0);
+	assert(plugin_argc == 2);
+	assert(!strcmp(plugin_argv[1], "--example.option=config"));
+	cr_plugin_options_clear();
+
+	assert(cr_plugin_option_add_arg("missing.option=value") == 0);
+	assert(criu_plugin_get_options(&plugin_argc, &plugin_argv) == 0);
+	assert(plugin_argc == 2);
+	assert(!strcmp(plugin_argv[1], "--missing.option=value"));
+
+	/* Plugin option without an explicit value (flag) */
+	assert(cr_plugin_option_add_arg("example.option") == 0);
+	assert(criu_plugin_get_options(&plugin_argc, &plugin_argv) == 0);
+	assert(plugin_argc == 3);
+	assert(!strcmp(plugin_argv[2], "--example.option"));
+
+	assert(cr_plugin_option_add_arg("example") == -1);
+	assert(cr_plugin_option_add_arg("example.") == -1);
+	assert(cr_plugin_option_add_arg(".option") == -1);
+	assert(cr_plugin_option_add_arg(".option=value") == -1);
+	assert(cr_plugin_option_add_arg("example.=value") == -1);
+	assert(cr_plugin_option_add_arg("--example.option") == -1);
+	assert(cr_plugin_option_add_arg("-example.option") == -1);
+
+	cr_plugin_options_clear();
+	assert(criu_plugin_get_options(&plugin_argc, &plugin_argv) == 0);
+	assert(plugin_argc == 1);
+	assert(!strcmp(plugin_argv[0], "criu-plugin"));
+	assert(plugin_argv[1] == NULL);
+	assert(criu_plugin_get_options(NULL, &plugin_argv) == -EINVAL);
+	assert(criu_plugin_get_options(&plugin_argc, NULL) == -EINVAL);
+
+	/* Test that init_opts() resets plugin options */
+	assert(cr_plugin_option_add_arg("example.option=saved") == 0);
+	cr_plugin_default_options_parsed();
+	assert(criu_plugin_get_options(&plugin_argc, &plugin_argv) == 0);
+	assert(plugin_argc == 2);
+
+	assert(init_opts() == 0);
+	assert(criu_plugin_get_options(&plugin_argc, &plugin_argv) == 0);
+	assert(plugin_argc == 1);
+	assert(!strcmp(plugin_argv[0], "criu-plugin"));
+	assert(plugin_argv[1] == NULL);
+
+	cr_plugin_options_clear();
+}
 
 static void test_pagemap_offset_alignment(void)
 {
@@ -120,11 +345,11 @@ static void test_compress_roundtrip(const char *page, int acceleration)
 	char decompressed[PAGE_SIZE];
 	int cs;
 
-	cs = compress_data(page, PAGE_SIZE, compressed,
-			   PAGE_COMPRESSED_SIZE_BOUND, acceleration);
-	assert(cs > 0);
+	cs = compress_block(page, 1, compressed,
+			    PAGE_COMPRESSED_SIZE_BOUND, acceleration);
+	assert(cs >= 0);
 	assert(cs <= PAGE_COMPRESSED_SIZE_BOUND);
-	assert(decompress_data(compressed, cs, PAGE_SIZE, decompressed) == 0);
+	assert(decompress_block(compressed, cs, 1, decompressed) == 0);
 	assert(memcmp(page, decompressed, PAGE_SIZE) == 0);
 }
 
@@ -148,12 +373,12 @@ static void test_compression(void)
 		int accel = accels[a];
 		int cs;
 
-		/* Zero-filled page: should compress well */
+		/* Zero-filled page: should return 0 for zero-page block */
 		memset(cbuf, 0, sizeof(cbuf));
 		memset(page, 0, PAGE_SIZE);
-		cs = compress_data(page, PAGE_SIZE,
-				   cbuf, PAGE_COMPRESSED_SIZE_BOUND, accel);
-		assert(cs > 0 && cs < PAGE_SIZE);
+		cs = compress_block(page, 1,
+				    cbuf, PAGE_COMPRESSED_SIZE_BOUND, accel);
+		assert(cs == 0);
 		test_compress_roundtrip(page, accel);
 
 		/* Repeating pattern */
@@ -171,11 +396,23 @@ static void test_compression(void)
 		memset(cbuf, 0, sizeof(cbuf));
 		memset(page, 0, PAGE_SIZE);
 		page[0] = 0x42;
-		cs = compress_data(page, PAGE_SIZE,
-				   cbuf, PAGE_COMPRESSED_SIZE_BOUND, accel);
+		cs = compress_block(page, 1,
+				    cbuf, PAGE_COMPRESSED_SIZE_BOUND, accel);
 		assert(cs > 0 && cs < PAGE_SIZE);
 		test_compress_roundtrip(page, accel);
 	}
+}
+
+static void test_encoded_stream_zero_batch(void)
+{
+	uint32_t block_sizes[] = { 0, 0 };
+	char pages[2 * PAGE_SIZE];
+	size_t i;
+
+	memset(pages, 0xa5, sizeof(pages));
+	assert(encoded_stream_read_batch(-1, pages, block_sizes, 2, 0, 0, NULL, 0) == 0);
+	for (i = 0; i < sizeof(pages); i++)
+		assert(pages[i] == 0);
 }
 
 static unsigned int count_task_threads(void)
@@ -220,7 +457,7 @@ static void test_parallel_decompression(void)
 	const size_t nr_jobs = 8;
 	const size_t job_bytes = (size_t)pages_per_job * PAGE_SIZE;
 	const size_t src_size = nr_jobs * job_bytes;
-	const size_t compressed_stride = REGION_COMPRESSED_SIZE_BOUND(pages_per_job);
+	const size_t compressed_stride = BLOCK_COMPRESSED_SIZE_BOUND(pages_per_job);
 	struct decompress_job *jobs;
 	char *compressed;
 	char *decompressed;
@@ -283,7 +520,7 @@ static void test_parallel_decompression(void)
 
 		for (byte = 0; byte < job_bytes; byte++)
 			job_src[byte] = (char)(job + byte);
-		cs = compress_region(job_src, pages_per_job, job_compressed, compressed_stride, 1);
+		cs = compress_block(job_src, pages_per_job, job_compressed, compressed_stride, 1);
 		assert(cs > 0 && (size_t)cs < job_bytes);
 
 		jobs[job].src = job_compressed;
@@ -349,37 +586,37 @@ static void test_parallel_decompression(void)
 	free(src);
 }
 
-static void test_region_roundtrip(const char *src, unsigned int n_pages,
-				  int acceleration)
+static void test_block_roundtrip(const char *src, unsigned int n_pages,
+				 int acceleration)
 {
-	size_t region_bytes = (size_t)n_pages * PAGE_SIZE;
-	size_t cap = REGION_COMPRESSED_SIZE_BOUND(n_pages);
+	size_t block_bytes = (size_t)n_pages * PAGE_SIZE;
+	size_t cap = BLOCK_COMPRESSED_SIZE_BOUND(n_pages);
 	char *cbuf = malloc(cap);
-	char *dec = malloc(region_bytes);
+	char *dec = malloc(block_bytes);
 	int cs;
 
 	assert(cbuf && dec);
-	cs = compress_region(src, n_pages, cbuf, cap, acceleration);
+	cs = compress_block(src, n_pages, cbuf, cap, acceleration);
 	assert(cs >= 0);
-	assert((size_t)cs <= region_bytes);
-	assert(decompress_region(cbuf, cs, n_pages, dec) == 0);
-	assert(memcmp(src, dec, region_bytes) == 0);
+	assert((size_t)cs <= block_bytes);
+	assert(decompress_block(cbuf, cs, n_pages, dec) == 0);
+	assert(memcmp(src, dec, block_bytes) == 0);
 
 	free(cbuf);
 	free(dec);
 }
 
-static void test_region_compression(void)
+static void test_block_compression(void)
 {
-	unsigned int sizes[] = { 1, DEFAULT_REGION_PAGES, MAX_REGION_PAGES };
+	unsigned int sizes[] = { 1, DEFAULT_BLOCK_PAGES, MAX_BLOCK_PAGES };
 	const int accels[] = { 1, 4, 32 };
 	unsigned int s, a;
 
 	for (s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
 		unsigned int n_pages = sizes[s];
-		size_t region_bytes = (size_t)n_pages * PAGE_SIZE;
-		char *src = malloc(region_bytes);
-		size_t cap = REGION_COMPRESSED_SIZE_BOUND(n_pages);
+		size_t block_bytes = (size_t)n_pages * PAGE_SIZE;
+		char *src = malloc(block_bytes);
+		size_t cap = BLOCK_COMPRESSED_SIZE_BOUND(n_pages);
 		char *cbuf = malloc(cap);
 		size_t i;
 
@@ -390,40 +627,40 @@ static void test_region_compression(void)
 			int cs;
 			uint32_t state;
 
-			/* All-zero region: must short-circuit to 0 bytes. */
-			memset(src, 0, region_bytes);
-			cs = compress_region(src, n_pages, cbuf, cap, accel);
+			/* All-zero block: must short-circuit to 0 bytes. */
+			memset(src, 0, block_bytes);
+			cs = compress_block(src, n_pages, cbuf, cap, accel);
 			assert(cs == 0);
-			test_region_roundtrip(src, n_pages, accel);
+			test_block_roundtrip(src, n_pages, accel);
 
 			/* Repeating pattern: should compress well. */
-			for (i = 0; i < region_bytes; i++)
+			for (i = 0; i < block_bytes; i++)
 				src[i] = (char)(i & 0xff);
-			cs = compress_region(src, n_pages, cbuf, cap, accel);
+			cs = compress_block(src, n_pages, cbuf, cap, accel);
 			assert(cs > 0);
-			assert((size_t)cs < region_bytes);
-			test_region_roundtrip(src, n_pages, accel);
+			assert((size_t)cs < block_bytes);
+			test_block_roundtrip(src, n_pages, accel);
 
 			/* Deterministic high-entropy bytes must use the raw fallback. */
 			state = 0x9e3779b9U ^ (a + 1) ^ n_pages;
 
-			for (i = 0; i < region_bytes; i++) {
+			for (i = 0; i < block_bytes; i++) {
 				state ^= state << 13;
 				state ^= state >> 17;
 				state ^= state << 5;
 				src[i] = (char)(state >> 24);
 			}
-			cs = compress_region(src, n_pages, cbuf, cap, accel);
-			assert((size_t)cs == region_bytes);
-			test_region_roundtrip(src, n_pages, accel);
+			cs = compress_block(src, n_pages, cbuf, cap, accel);
+			assert((size_t)cs == block_bytes);
+			test_block_roundtrip(src, n_pages, accel);
 
 			/* Mostly zeros with one non-zero island. */
-			memset(src, 0, region_bytes);
+			memset(src, 0, block_bytes);
 			memset(src + (n_pages / 2) * PAGE_SIZE, 0xab, PAGE_SIZE);
-			cs = compress_region(src, n_pages, cbuf, cap, accel);
+			cs = compress_block(src, n_pages, cbuf, cap, accel);
 			assert(cs > 0);
-			assert((size_t)cs < region_bytes);
-			test_region_roundtrip(src, n_pages, accel);
+			assert((size_t)cs < block_bytes);
+			test_block_roundtrip(src, n_pages, accel);
 		}
 
 		free(src);
@@ -444,6 +681,8 @@ int main(int argc, char *argv[], char *envp[])
 	test_bfd();
 	test_bwrite();
 	test_pagemap_offset_alignment();
+	test_plugin_dispatch_all();
+	test_plugin_options();
 
 	i = parse_statement(0, "", configuration);
 	assert(i == 0);
@@ -574,8 +813,9 @@ int main(int argc, char *argv[], char *envp[])
 
 #ifdef CONFIG_LZ4
 	test_compression();
+	test_encoded_stream_zero_batch();
 	test_parallel_decompression();
-	test_region_compression();
+	test_block_compression();
 #endif
 
 	pr_msg("OK\n");

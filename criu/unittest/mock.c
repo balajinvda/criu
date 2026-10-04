@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <sys/types.h>
 
 #include "compel/infect-util.h"
 
@@ -144,3 +145,8 @@ int check_mount_v2(void)
 }
 
 char compel_run_id[RUN_ID_HASH_LENGTH];
+
+int pread_full(int fd, void *buf, size_t count, off_t offset)
+{
+	return -1;
+}

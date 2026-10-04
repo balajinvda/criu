@@ -95,6 +95,14 @@ The following levels are available:
 *-L*, *--libdir* 'path'::
     Path to plugins directory.
 
+*--plugin-option=PLUGIN.NAME[=VALUE]*::
+    Pass an option to a plugin. The plugin is responsible for validating and
+    interpreting the value. The option applies to dump, pre-dump, and restore.
+    It may be repeated; CRIU preserves every occurrence in configuration order,
+    followed by request-specific options. Plugins ignore options they do not
+    recognize. For example: *--plugin-option=example.option=value* or
+    *--plugin-option=example.flag*.
+
 *--enable-fs* ['fs'[,'fs'...]]::
     Specify a comma-separated list of filesystem names that should
     be auto-detected. The value 'all' enables auto-detection for
@@ -379,28 +387,29 @@ mount -t cgroup -o devices,freezer none devices,freezer
     during *restore*).
 
 *-c, --compress*::
-    Enable LZ4 per-page compression of memory pages during *dump*.
-    Each system page is compressed as an independent LZ4 block.
-    Zero-filled pages are detected and stored with no data; pages that
-    do not compress well are stored raw to avoid decompression overhead
-    on *restore*. The compression choice made at *dump* time is recorded
-    in the inventory image and applied automatically on *restore*.
-    Compatible with *--page-server* when *--tls* is not used, *--stream*,
-    *--lazy-pages*, iterative checkpointing, *--auto-dedup*, and the *dedup*
-    command.
+    Enable LZ4 compression of memory pages during *dump*.
+    Each page is compressed as an independent LZ4 block.
+    Zero-filled pages are detected and stored with no data; pages with
+    low compression ratio (compressed size exceeds 7/8 of the original size)
+    are stored raw to avoid decompression overhead on *restore*. The
+    compression config is recorded in the inventory image and applied
+    automatically on *restore*. This functionality is compatible with
+    *--page-server*, *--stream*, *--lazy-pages*,
+    iterative checkpointing, *--auto-dedup*, and the *dedup* command.
 
-*--compress-region* 'size'::
-    Enable LZ4 region compression of memory pages during *dump*.
+*--compress-block* 'size'::
+    Enable LZ4 block compression of memory pages during *dump*.
     A run of consecutive pages totalling 'size' bytes is compressed as
     a single LZ4 block, which yields a better ratio and faster dump
-    on heap-shaped data than per-page compression at the cost of
+    on heap-shaped data than page-sized compression at the cost of
     slightly slower restore on partial reads. 'size' accepts K/M/G
     suffixes (e.g. *256K*, *1M*); it must be a multiple of the system
-    page size and at most 4M. Mutually exclusive with *--compress*.
-    Currently supports only the local image path (no
-    *--page-server* / *--stream*). Hole-punching deduplication is
-    skipped for compressed images since compressed pages are
-    variably-sized.
+    page size and at most 4M. When both this option and *--compress* are
+    specified, the last option takes precedence.
+    Page-sized blocks are compatible with *--page-server* and *--stream*;
+    multi-page blocks currently support only the local image path.
+    Hole-punching deduplication is skipped for compressed images since
+    compressed blocks are variably-sized.
 
 *--compress-acceleration* 'N'::
     Set the LZ4 acceleration level for page compression (1 to 65537).
@@ -408,7 +417,7 @@ mount -t cgroup -o devices,freezer none devices,freezer
     sequences. The default value of 1 gives the best compression
     ratio. Higher values skip more match candidates, resulting in
     faster compression but larger output. Decompression speed is not
-    affected. Implies *--compress* unless *--compress-region* is set.
+    affected. Implies *--compress* unless *--compress-block* is set.
 
 *--decompress-threads* 'N'::
     Set worker concurrency for LZ4 decoding and eligible large zero fills,

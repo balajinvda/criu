@@ -37,11 +37,10 @@ message inventory_entry {
 	/*
 	 * Memory page compression mode. Encodes enum compress_mode:
 	 *   0 = COMPRESS_OFF
-	 *   1 = COMPRESS_PER_PAGE
-	 *   2 = COMPRESS_REGION
+	 *   1 = COMPRESS_BLOCK
 	 * Absent or 0 means no compression was applied to the dump.
 	 */
 	optional uint32			compress = 15;
-	/* Region size in bytes when compress = 2. Informational. */
-	optional uint32			compress_region_size = 16;
+	/* Block size in bytes when compress = 1. Informational. */
+	optional uint32			compress_block_size = 16;
 }

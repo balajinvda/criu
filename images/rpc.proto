@@ -153,11 +153,11 @@ message criu_opts {
 	optional criu_image_io_mode	image_io_mode		= 72 [default = IMAGE_IO_WRITEBACK];
 	/*
 	 * Memory page compression mode (enum compress_mode):
-	 *   0 = off, 1 = per-page, 2 = region. Default 0.
+	 *   0 = off, 1 = block. Default 0.
 	 */
 	optional uint32			compress		= 73;
 	optional uint32			compress_acceleration	= 74;
-	optional uint32			compress_region_size	= 75;
+	optional uint32			compress_block_size	= 75;
 	/*
 	 * Worker concurrency for LZ4 decoding and eligible large zero fills.
 	 * 0 selects automatic concurrency; 1, the default, keeps LZ4 decoding
@@ -167,6 +167,9 @@ message criu_opts {
 	 * through 1024. Restore-time only.
 	 */
 	optional uint32			decompress_threads	= 76 [default = 1];
+	/* Plugin-owned namespaced options in PLUGIN.NAME[=VALUE] form. */
+	repeated string			plugin_options		= 77;
+	optional bool			stream			= 78;
 /*	optional bool			check_mounts		= 128;	*/
 }
 

@@ -166,7 +166,7 @@ int check_img_inventory(bool restore)
 		/* Validate the protobuf uint32 before narrowing it to the signed
 		 * command-line option field. Values above INT_MAX would otherwise
 		 * become negative and evade a signed upper-bound check. */
-		if (he->compress > COMPRESS_REGION) {
+		if (he->compress > COMPRESS_BLOCK) {
 			pr_err("Image has unknown compression mode %u\n", he->compress);
 			goto out_err;
 		}
@@ -175,9 +175,16 @@ int check_img_inventory(bool restore)
 			       he->img_version);
 			goto out_err;
 		}
-		opts.compress_mode = he->compress;
-		if (he->has_compress_region_size)
-			opts.compress_region_size = he->compress_region_size;
+		opts.compress_mode = he->compress ? COMPRESS_BLOCK : COMPRESS_OFF;
+		if (opts.compress_mode) {
+			if (he->has_compress_block_size && he->compress_block_size)
+				opts.compress_block_size = he->compress_block_size;
+			else if (!opts.compress_block_size)
+				opts.compress_block_size = PAGE_SIZE;
+		} else if (restore) {
+			opts.compress_acceleration = 0;
+			opts.compress_block_size = 0;
+		}
 
 		/*
 		 * On restore the compression mode usually comes from the
@@ -192,27 +199,25 @@ int check_img_inventory(bool restore)
 #else
 			/*
 			 * The image-streamer and page-server/remote restore
-			 * readers only understand the per-page wire format.
-			 * A region-compressed image must use the local
+			 * readers only understand page-sized blocks.
+			 * A multi-page block-compressed image must use the local
 			 * restore path.
 			 */
-			if (opts.compress_mode == COMPRESS_REGION) {
+			if (opts.compress_block_size > PAGE_SIZE) {
 				if (opts.stream) {
-					pr_err("Region-compressed image cannot be restored with --stream\n");
+					pr_err("Multi-page block compressed image cannot be restored with --stream\n");
 					goto out_err;
 				}
 				if (opts.use_page_server || opts.addr) {
-					pr_err("Region-compressed image cannot be restored via page-server\n");
+					pr_err("Multi-page block compressed image cannot be restored via page-server\n");
 					goto out_err;
 				}
 			}
 #endif
 		}
 
-		if (opts.compress_mode == COMPRESS_REGION)
-			pr_debug("Region decompression of memory pages is enabled\n");
-		else if (opts.compress_mode == COMPRESS_PER_PAGE)
-			pr_debug("Per-page decompression of memory pages is enabled\n");
+		if (opts.compress_mode)
+			pr_debug("Block decompression of memory pages is enabled\n");
 	} else if (restore) {
 		/*
 		 * Image without compression metadata (e.g. an older image).
@@ -221,7 +226,7 @@ int check_img_inventory(bool restore)
 		 */
 		opts.compress_mode = COMPRESS_OFF;
 		opts.compress_acceleration = 0;
-		opts.compress_region_size = 0;
+		opts.compress_block_size = 0;
 	}
 
 	ret = 0;
@@ -233,31 +238,52 @@ out_close:
 	return ret;
 }
 
+static struct inventory_plugin *find_inventory_plugin(const char *name)
+{
+	struct inventory_plugin *p;
+
+	list_for_each_entry(p, &inventory_plugins_list, node) {
+		if (!strcmp(name, p->name))
+			return p;
+	}
+
+	return NULL;
+}
+
 /**
- * Check if the 'plugins' field in the inventory image contains
- * the specified plugin name. If found, the plugin is removed
- * from the linked list.
+ * Check whether the 'plugins' field in the inventory image contains an exact
+ * match for the specified logical plugin name. This entry is left in the list
+ * (not removed and n_inventory_plugins is not decremented), so it can still be
+ * matched again later.
  */
-bool check_and_remove_inventory_plugin(const char *name, size_t n)
+bool has_inventory_plugin(const char *name)
 {
 	if (n_inventory_plugins == -1)
 		return true; /* backwards compatibility */
 
-	if (n_inventory_plugins > 0) {
-		struct inventory_plugin *p, *tmp;
+	return n_inventory_plugins > 0 && find_inventory_plugin(name);
+}
 
-		list_for_each_entry_safe(p, tmp, &inventory_plugins_list, node) {
-			if (!strncmp(name, p->name, n)) {
-				xfree(p->name);
-				list_del(&p->node);
-				xfree(p);
-				n_inventory_plugins--;
-				return true;
-			}
-		}
-	}
+/**
+ * Similar to the above function, check if the 'plugins' field contains
+ * the specified plugin name, but if it is found, remove it from the list.
+ */
+bool check_and_remove_inventory_plugin(const char *name)
+{
+	struct inventory_plugin *p;
 
-	return false;
+	if (n_inventory_plugins == -1)
+		return true; /* backwards compatibility */
+
+	p = find_inventory_plugin(name);
+	if (!p)
+		return false;
+
+	xfree(p->name);
+	list_del(&p->node);
+	xfree(p);
+	n_inventory_plugins--;
+	return true;
 }
 
 /**
@@ -406,7 +432,8 @@ int get_parent_inventory(InventoryEntry **parent_ie)
 	if (dir < 0)
 		return 0;
 
-	img = open_image_at(dir, CR_FD_INVENTORY, O_RSTR);
+	/* The parent snapshot is always on disk, even when streaming */
+	img = open_image_at(dir, CR_FD_INVENTORY, O_RSTR | O_FORCE_LOCAL);
 	if (!img) {
 		pr_err("Failed to open parent pre-dump inventory image\n");
 		close(dir);
@@ -429,7 +456,7 @@ int get_parent_inventory(InventoryEntry **parent_ie)
 		pr_err("Unsupported parent image version %u\n", ie->img_version);
 		goto err;
 	}
-	if (ie->has_compress && ie->compress > COMPRESS_REGION) {
+	if (ie->has_compress && ie->compress > COMPRESS_BLOCK) {
 		pr_err("Parent image has unknown compression mode %u\n",
 		       ie->compress);
 		goto err;
@@ -510,9 +537,9 @@ int prepare_inventory(InventoryEntry *he, const InventoryEntry *parent_ie)
 	if (!he->dump_criu_run_id)
 		return -1;
 
-	if (opts.compress_mode == COMPRESS_REGION && opts.compress_region_size) {
-		he->has_compress_region_size = true;
-		he->compress_region_size = opts.compress_region_size;
+	if (opts.compress_mode == COMPRESS_BLOCK && opts.compress_block_size) {
+		he->has_compress_block_size = true;
+		he->compress_block_size = opts.compress_block_size;
 	}
 
 	return 0;
@@ -826,6 +853,26 @@ struct cr_img *img_from_fd(int fd)
 }
 
 /*
+ * The mode open_image_dir() wants for the current operation, or -1 for an
+ * operation that does not read or write an image set of its own.
+ */
+int image_dir_mode(void)
+{
+	switch (opts.mode) {
+	case CR_DUMP:
+		/* fallthrough */
+	case CR_CPUINFO_DUMP:
+		/* fallthrough */
+	case CR_PRE_DUMP:
+		return O_DUMP;
+	case CR_RESTORE:
+		return O_RSTR;
+	default:
+		return -1;
+	}
+}
+
+/*
  * `mode` should be O_RSTR or O_DUMP depending on the intent.
  * This is used when opts.stream is enabled for picking the right streamer
  * socket name. `mode` is ignored when opts.stream is not enabled.
@@ -850,7 +897,9 @@ int open_image_dir(const char *dir, int mode)
 	if (opts.stream) {
 		if (img_streamer_init(dir, mode) < 0)
 			goto err;
-	} else if (opts.img_parent) {
+	}
+
+	if (opts.img_parent) {
 		if (faccessat(fd, opts.img_parent, R_OK, 0)) {
 			pr_perror("Invalid parent image directory provided");
 			goto err;
@@ -919,7 +968,9 @@ void up_page_ids_base(void)
 
 struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
 {
-	if (flags == O_RDONLY || flags == O_RDWR) {
+	unsigned long mode = flags & ~O_FORCE_LOCAL;
+
+	if (mode == O_RDONLY || mode == O_RDWR) {
 		PagemapHead *h;
 		if (pb_read_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
 			return NULL;

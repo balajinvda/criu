@@ -214,6 +214,13 @@ void criu_local_free_opts(criu_opts *opts)
 	}
 	opts->rpc->n_external = 0;
 
+	if (opts->rpc->plugin_options) {
+		for (i = 0; i < opts->rpc->n_plugin_options; i++)
+			free(opts->rpc->plugin_options[i]);
+		free(opts->rpc->plugin_options);
+	}
+	opts->rpc->n_plugin_options = 0;
+
 	if (opts->rpc->join_ns) {
 		for (i = 0; i < opts->rpc->n_join_ns; i++) {
 			free(opts->rpc->join_ns[i]->ns);
@@ -376,16 +383,27 @@ void criu_set_track_mem(bool track_mem)
 	criu_local_set_track_mem(global_opts, track_mem);
 }
 
+void criu_local_set_lazy_pages(criu_opts *opts, bool lazy_pages)
+{
+	opts->rpc->has_lazy_pages = true;
+	opts->rpc->lazy_pages = lazy_pages;
+}
+
+void criu_set_lazy_pages(bool lazy_pages)
+{
+	criu_local_set_lazy_pages(global_opts, lazy_pages);
+}
+
 int criu_local_set_compress(criu_opts *opts, enum criu_compress_mode mode)
 {
-	if (mode < CRIU_COMPRESS_OFF || mode > CRIU_COMPRESS_REGION)
+	if (mode != CRIU_COMPRESS_OFF && mode != CRIU_COMPRESS_BLOCK)
 		return -EINVAL;
 
 	opts->rpc->has_compress = true;
 	opts->rpc->compress = mode;
-	if (mode != CRIU_COMPRESS_REGION) {
-		opts->rpc->has_compress_region_size = false;
-		opts->rpc->compress_region_size = 0;
+	if (mode != CRIU_COMPRESS_BLOCK) {
+		opts->rpc->has_compress_block_size = false;
+		opts->rpc->compress_block_size = 0;
 	}
 	if (mode == CRIU_COMPRESS_OFF) {
 		opts->rpc->has_compress_acceleration = false;
@@ -402,15 +420,27 @@ int criu_set_compress(enum criu_compress_mode mode)
 int criu_local_set_compress_acceleration(criu_opts *opts,
 					 unsigned int acceleration)
 {
+	bool enable_page_compression;
+	long page_size = 0;
+
 	if (acceleration < 1 || acceleration > CRIU_COMPRESS_MAX_ACCELERATION)
 		return -EINVAL;
 
+	enable_page_compression = !opts->rpc->has_compress ||
+				  opts->rpc->compress == CRIU_COMPRESS_OFF;
+	if (enable_page_compression) {
+		page_size = sysconf(_SC_PAGESIZE);
+		if (page_size <= 0 || page_size > UINT_MAX)
+			return -EINVAL;
+	}
+
 	opts->rpc->has_compress_acceleration = true;
 	opts->rpc->compress_acceleration = acceleration;
-	if (!opts->rpc->has_compress ||
-	    opts->rpc->compress == CRIU_COMPRESS_OFF) {
+	if (enable_page_compression) {
 		opts->rpc->has_compress = true;
-		opts->rpc->compress = CRIU_COMPRESS_PER_PAGE;
+		opts->rpc->compress = CRIU_COMPRESS_BLOCK;
+		opts->rpc->has_compress_block_size = true;
+		opts->rpc->compress_block_size = (unsigned int)page_size;
 	}
 	return 0;
 }
@@ -420,24 +450,24 @@ int criu_set_compress_acceleration(unsigned int acceleration)
 	return criu_local_set_compress_acceleration(global_opts, acceleration);
 }
 
-int criu_local_set_compress_region_size(criu_opts *opts, unsigned int bytes)
+int criu_local_set_compress_block_size(criu_opts *opts, unsigned int bytes)
 {
 	long page_size = sysconf(_SC_PAGESIZE);
 
-	if (page_size <= 0 || !bytes || bytes > CRIU_COMPRESS_MAX_REGION_SIZE ||
+	if (page_size <= 0 || !bytes || bytes > CRIU_COMPRESS_MAX_BLOCK_SIZE ||
 	    bytes % (unsigned long)page_size)
 		return -EINVAL;
 
-	opts->rpc->has_compress_region_size = true;
-	opts->rpc->compress_region_size = bytes;
+	opts->rpc->has_compress_block_size = true;
+	opts->rpc->compress_block_size = bytes;
 	opts->rpc->has_compress = true;
-	opts->rpc->compress = CRIU_COMPRESS_REGION;
+	opts->rpc->compress = CRIU_COMPRESS_BLOCK;
 	return 0;
 }
 
-int criu_set_compress_region_size(unsigned int bytes)
+int criu_set_compress_block_size(unsigned int bytes)
 {
-	return criu_local_set_compress_region_size(global_opts, bytes);
+	return criu_local_set_compress_block_size(global_opts, bytes);
 }
 
 int criu_local_set_decompress_threads(criu_opts *opts, unsigned int threads)
@@ -464,6 +494,17 @@ void criu_local_set_auto_dedup(criu_opts *opts, bool auto_dedup)
 void criu_set_auto_dedup(bool auto_dedup)
 {
 	criu_local_set_auto_dedup(global_opts, auto_dedup);
+}
+
+void criu_local_set_stream(criu_opts *opts, bool stream)
+{
+	opts->rpc->has_stream = true;
+	opts->rpc->stream = stream;
+}
+
+void criu_set_stream(bool stream)
+{
+	criu_local_set_stream(global_opts, stream);
 }
 
 void criu_local_set_force_irmap(criu_opts *opts, bool force_irmap)
@@ -508,6 +549,17 @@ void criu_local_set_leave_running(criu_opts *opts, bool leave_running)
 void criu_set_leave_running(bool leave_running)
 {
 	criu_local_set_leave_running(global_opts, leave_running);
+}
+
+void criu_local_set_leave_stopped(criu_opts *opts, bool leave_stopped)
+{
+	opts->rpc->has_leave_stopped = true;
+	opts->rpc->leave_stopped = leave_stopped;
+}
+
+void criu_set_leave_stopped(bool leave_stopped)
+{
+	criu_local_set_leave_stopped(global_opts, leave_stopped);
 }
 
 void criu_local_set_ext_unix_sk(criu_opts *opts, bool ext_unix_sk)
@@ -839,6 +891,28 @@ int criu_set_log_file(const char *log_file)
 	return criu_local_set_log_file(global_opts, log_file);
 }
 
+void criu_local_set_log_to_stderr(criu_opts *opts, bool log_to_stderr)
+{
+	opts->rpc->has_log_to_stderr = true;
+	opts->rpc->log_to_stderr = log_to_stderr;
+}
+
+void criu_set_log_to_stderr(bool log_to_stderr)
+{
+	criu_local_set_log_to_stderr(global_opts, log_to_stderr);
+}
+
+void criu_local_set_display_stats(criu_opts *opts, bool display_stats)
+{
+	opts->rpc->has_display_stats = true;
+	opts->rpc->display_stats = display_stats;
+}
+
+void criu_set_display_stats(bool display_stats)
+{
+	criu_local_set_display_stats(global_opts, display_stats);
+}
+
 void criu_local_set_cpu_cap(criu_opts *opts, unsigned int cap)
 {
 	opts->rpc->has_cpu_cap = true;
@@ -1100,8 +1174,7 @@ int criu_local_add_irmap_path(criu_opts *opts, const char *path)
 	return 0;
 
 err:
-	if (my_path)
-		free(my_path);
+	free(my_path);
 
 	return -ENOMEM;
 }
@@ -1167,6 +1240,26 @@ int criu_local_add_cg_yard(criu_opts *opts, const char *path)
 	free(opts->rpc->cgroup_yard);
 	opts->rpc->cgroup_yard = new;
 	return 0;
+}
+
+int criu_add_cg_props(const char *stream)
+{
+	return criu_local_add_cg_props(global_opts, stream);
+}
+
+int criu_add_cg_props_file(const char *path)
+{
+	return criu_local_add_cg_props_file(global_opts, path);
+}
+
+int criu_add_cg_dump_controller(const char *name)
+{
+	return criu_local_add_cg_dump_controller(global_opts, name);
+}
+
+int criu_add_cg_yard(const char *path)
+{
+	return criu_local_add_cg_yard(global_opts, path);
 }
 
 int criu_add_skip_mnt(const char *mnt)
@@ -1250,8 +1343,7 @@ int criu_local_add_external(criu_opts *opts, const char *key)
 	opts->rpc->n_external = nr;
 	return 0;
 err:
-	if (e)
-		free(e);
+	free(e);
 	return -ENOMEM;
 }
 
@@ -1260,25 +1352,70 @@ int criu_add_external(const char *key)
 	return criu_local_add_external(global_opts, key);
 }
 
+int criu_local_add_plugin_option(criu_opts *opts, const char *option)
+{
+	const char *dot, *equal;
+	char **options;
+	char *copy;
+	int nr;
+
+	if (!opts || !opts->rpc || !option || !option[0])
+		return -EINVAL;
+	dot = strchr(option, '.');
+	equal = strchr(option, '=');
+	if (option[0] == '-' || !dot || dot == option || dot[1] == '\0' || (equal && equal <= dot + 1))
+		return -EINVAL;
+	if (opts->rpc->n_plugin_options >= INT_MAX - 1)
+		return -E2BIG;
+
+	copy = strdup(option);
+	if (!copy)
+		return -ENOMEM;
+
+	nr = opts->rpc->n_plugin_options + 1;
+	if ((size_t)nr > SIZE_MAX / sizeof(*options))
+		goto err_too_big;
+	options = realloc(opts->rpc->plugin_options, nr * sizeof(*options));
+	if (!options)
+		goto err;
+
+	options[nr - 1] = copy;
+	opts->rpc->plugin_options = options;
+	opts->rpc->n_plugin_options = nr;
+	return 0;
+
+err:
+	free(copy);
+	return -ENOMEM;
+err_too_big:
+	free(copy);
+	return -E2BIG;
+}
+
+int criu_add_plugin_option(const char *option)
+{
+	return criu_local_add_plugin_option(global_opts, option);
+}
+
 int criu_local_set_page_server_address_port(criu_opts *opts, const char *address, int port)
 {
 	opts->rpc->ps = malloc(sizeof(CriuPageServerInfo));
-	if (opts->rpc->ps) {
-		criu_page_server_info__init(opts->rpc->ps);
+	if (!opts->rpc->ps)
+		return -ENOMEM;
 
-		opts->rpc->ps->address = strdup(address);
-		if (!opts->rpc->ps->address) {
-			free(opts->rpc->ps);
-			opts->rpc->ps = NULL;
-			goto out;
-		}
+	criu_page_server_info__init(opts->rpc->ps);
 
-		opts->rpc->ps->has_port = true;
-		opts->rpc->ps->port = port;
+	opts->rpc->ps->address = strdup(address);
+	if (!opts->rpc->ps->address) {
+		free(opts->rpc->ps);
+		opts->rpc->ps = NULL;
+		return -ENOMEM;
 	}
 
-out:
-	return -ENOMEM;
+	opts->rpc->ps->has_port = true;
+	opts->rpc->ps->port = port;
+
+	return 0;
 }
 
 int criu_set_page_server_address_port(const char *address, int port)
@@ -2037,14 +2174,10 @@ int criu_local_join_ns_add(criu_opts *opts, const char *ns, const char *ns_file,
 	return 0;
 
 err:
-	if (_ns)
-		free(_ns);
-	if (_ns_file)
-		free(_ns_file);
-	if (_extra_opt)
-		free(_extra_opt);
-	if (join_ns)
-		free(join_ns);
+	free(_ns);
+	free(_ns_file);
+	free(_extra_opt);
+	free(join_ns);
 	return -1;
 }
 

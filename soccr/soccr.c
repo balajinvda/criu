@@ -729,9 +729,13 @@ int libsoccr_restore(struct libsoccr_sk *sk, struct libsoccr_sk_data *data, unsi
 	if (libsoccr_restore_queue(sk, data, sizeof(*data), TCP_RECV_QUEUE, sk->recv_queue))
 		return -1;
 
-	if (libsoccr_restore_queue(sk, data, sizeof(*data), TCP_SEND_QUEUE, sk->send_queue))
-		return -1;
-
+	/*
+	 * Window parameters must be restored after the receive queue
+	 * (so rcv_nxt is updated to inq_seq) and before the send queue
+	 * because restoring unsent data in the send queue temporarily
+	 * turns repair mode off and transmits data, which requires the
+	 * window to be set and may alter sequence numbers.
+	 */
 	if (data->flags & SOCCR_FLAGS_WINDOW) {
 		struct tcp_repair_window wopt = {
 			.snd_wl1 = data->snd_wl1,
@@ -746,11 +750,26 @@ int libsoccr_restore(struct libsoccr_sk *sk, struct libsoccr_sk_data *data, unsi
 			wopt.rcv_wnd++;
 		}
 
+		/*
+		 * Kernel's tcp_repair_set_window() returns -EINVAL if
+		 * after(opt.snd_wl1, tp->rcv_nxt + opt.rcv_wnd).
+		 *
+		 * When rcv_wnd is zero or retracted, snd_wl1 may legitimately
+		 * exceed data->inq_seq + wopt.rcv_wnd (e.g. zero-window probe
+		 * or out-of-order segment received within previous window).
+		 * Clamp snd_wl1 to pass kernel validation.
+		 */
+		if ((int32_t)(wopt.snd_wl1 - (data->inq_seq + wopt.rcv_wnd)) > 0)
+			wopt.snd_wl1 = data->inq_seq + wopt.rcv_wnd;
+
 		if (setsockopt(sk->fd, SOL_TCP, TCP_REPAIR_WINDOW, &wopt, sizeof(wopt))) {
 			logerr("Unable to set window parameters");
 			return -1;
 		}
 	}
+
+	if (libsoccr_restore_queue(sk, data, sizeof(*data), TCP_SEND_QUEUE, sk->send_queue))
+		return -1;
 
 	/*
 	 * To restore a half closed sockets, fin packets has to be restored in

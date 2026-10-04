@@ -54,26 +54,6 @@ void flush_early_log_to_stderr(void)
 	flush_early_log_buffer(STDERR_FILENO);
 }
 
-static int image_dir_mode(void)
-{
-	switch (opts.mode) {
-	case CR_DUMP:
-		/* fallthrough */
-	case CR_CPUINFO_DUMP:
-		/* fallthrough */
-	case CR_PRE_DUMP:
-		return O_DUMP;
-	case CR_RESTORE:
-		return O_RSTR;
-	default:
-		return -1;
-	}
-
-	/* never reached */
-	BUG();
-	return -1;
-}
-
 struct {
 	char *cmd;
 	int mode;
@@ -150,7 +130,8 @@ int main(int argc, char *argv[], char *envp[])
 	if (argc < 2)
 		goto usage;
 
-	init_opts();
+	if (init_opts())
+		return 1;
 
 	ret = parse_options(argc, argv, &usage_error, &has_exec_cmd, state);
 
@@ -162,6 +143,8 @@ int main(int argc, char *argv[], char *envp[])
 		pr_err("command is required\n");
 		goto usage;
 	}
+
+	cr_plugin_default_options_parsed();
 
 	log_set_loglevel(opts.log_level);
 
@@ -251,6 +234,9 @@ int main(int argc, char *argv[], char *envp[])
 		pr_err("--stream cannot be used with the %s command\n", cmd);
 		goto usage;
 	}
+
+	if (check_stream_conflicts())
+		goto usage;
 
 	/* We must not open imgs dir, if service is called */
 	if (opts.mode != CR_SERVICE) {
@@ -462,6 +448,7 @@ usage:
 	       "  -j|--" OPT_SHELL_JOB "        allow one to dump and restore shell jobs\n"
 	       "  -l|--" OPT_FILE_LOCKS "       handle file locks, for safety, only used for container\n"
 	       "  -L|--libdir           path to a plugin directory (by default " CR_PLUGIN_DEFAULT ")\n"
+	       "  --plugin-option=P.N[=V] pass an option to a plugin\n"
 	       "  --timeout NUM         a timeout (in seconds) on collecting tasks during dump\n"
 	       "                        (default 10 seconds)\n"
 	       "  --force-irmap         force resolving names for inotify/fsnotify watches\n"
@@ -560,15 +547,15 @@ usage:
 	       "  --pre-dump-mode       splice - parasite based pre-dumping (default)\n"
 	       "                        read   - process_vm_readv syscall based pre-dumping\n"
 #ifdef CONFIG_LZ4
-	       "  -c|--compress         enable LZ4 per-page compression of memory pages\n"
-	       "  --compress-region size\n"
-	       "                        enable memory page compression for given region size;\n"
+	       "  -c|--compress         enable page-sized LZ4 memory compression\n"
+	       "  --compress-block size\n"
+	       "                        enable memory page compression for given block size;\n"
 	       "                        size accepts K/M/G suffixes (e.g. 256K, 1M);\n"
 	       "                        valid range: page-size multiples up to 4M\n"
 	       "  --compress-acceleration N\n"
 	       "                        LZ4 acceleration (default is 1; max is 65537).\n"
 	       "                        Higher values favor speed over compression ratio.\n"
-	       "                        Implies --compress unless --compress-region is set.\n"
+	       "                        Implies --compress unless --compress-block is set.\n"
 	       "  --decompress-threads N\n"
 	       "                        worker concurrency for LZ4 decode and zero fill\n"
 	       "                        (default: 1 = serial per request; 0 = auto;\n"

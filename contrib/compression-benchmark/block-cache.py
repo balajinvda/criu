@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Benchmark repeated partial reads from region-compressed parent images.
+Benchmark repeated partial reads from block-compressed parent images.
 
 The workload intentionally modifies every other page after a compressed
 pre-dump. On restore, the final image reads alternating pages from the
 compressed parent image, which exercises repeated partial reads from the
-same region-compressed block.
+same compressed block.
 """
 
 import argparse
@@ -24,7 +24,7 @@ import tempfile
 import time
 
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-MAX_REGION_SIZE = 4 * 1024 * 1024
+MAX_BLOCK_SIZE = 4 * 1024 * 1024
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 DEFAULT_CRIU = os.path.join(REPO_ROOT, "criu", "criu")
@@ -151,10 +151,10 @@ def load_pagemap_entries(directory, pid):
     return entries[1:]
 
 
-def analyze_partial_region_reads(pre_entries, final_entries, mapping_start,
-                                 size, region_size):
+def analyze_partial_block_reads(pre_entries, final_entries, mapping_start,
+                                size, block_size):
     page_count = size // PAGE_SIZE
-    region_pages = region_size // PAGE_SIZE
+    block_pages_requested = block_size // PAGE_SIZE
     mapping_end = mapping_start + size
     pre_coverage = bytearray(page_count)
     lz4_blocks = []
@@ -169,13 +169,14 @@ def analyze_partial_region_reads(pre_entries, final_entries, mapping_start,
             continue
         if not _pagemap_flags(entry) & PE_PRESENT:
             raise TrialError("pre-dump does not contain the workload pages")
-        if entry.get("region_pages") != region_pages:
-            raise TrialError("pre-dump does not use the requested region size")
+        blocks = entry.get("blocks", {})
+        if blocks.get("pages_per_block") != block_pages_requested:
+            raise TrialError("pre-dump does not use the requested block size")
 
-        compressed_sizes = entry.get("compressed_size", [])
-        expected_blocks = (entry_pages + region_pages - 1) // region_pages
-        if len(compressed_sizes) != expected_blocks:
-            raise TrialError("pre-dump has incomplete region metadata")
+        block_sizes = blocks.get("block_sizes", [])
+        expected_blocks = (entry_pages + block_pages_requested - 1) // block_pages_requested
+        if len(block_sizes) != expected_blocks:
+            raise TrialError("pre-dump has incomplete block metadata")
 
         first_page = (overlap_start - mapping_start) // PAGE_SIZE
         last_page = (overlap_end - mapping_start) // PAGE_SIZE
@@ -183,8 +184,8 @@ def analyze_partial_region_reads(pre_entries, final_entries, mapping_start,
 
         block_start = entry_start
         pages_left = entry_pages
-        for compressed_size in compressed_sizes:
-            block_pages = min(region_pages, pages_left)
+        for compressed_size in block_sizes:
+            block_pages = min(block_pages_requested, pages_left)
             block_end = block_start + block_pages * PAGE_SIZE
             if (block_end > mapping_start and block_start < mapping_end and
                     0 < compressed_size < block_pages * PAGE_SIZE):
@@ -195,7 +196,7 @@ def analyze_partial_region_reads(pre_entries, final_entries, mapping_start,
     if not all(pre_coverage):
         raise TrialError("pre-dump does not cover the complete workload mapping")
     if not lz4_blocks:
-        raise TrialError("pre-dump workload has no LZ4-compressed region")
+        raise TrialError("pre-dump workload has no LZ4-compressed block")
 
     final_storage = bytearray(page_count)
     parent_extents = []
@@ -242,23 +243,23 @@ def analyze_partial_region_reads(pre_entries, final_entries, mapping_start,
             partial_parent_slices += 1
             slices_by_block[block_index] += 1
 
-    reused_regions = sum(count >= 2 for count in slices_by_block)
-    if not reused_regions:
+    reused_blocks = sum(count >= 2 for count in slices_by_block)
+    if not reused_blocks:
         raise TrialError(
-            "workload does not make repeated partial reads from an LZ4 region")
+            "workload does not make repeated partial reads from an LZ4 block")
     return {
         "partial_parent_slices": partial_parent_slices,
-        "reused_lz4_regions": reused_regions,
-        "max_slices_per_region": max(slices_by_block),
+        "reused_lz4_blocks": reused_blocks,
+        "max_slices_per_block": max(slices_by_block),
     }
 
 
-def validate_region_cache_images(pre_dir, dump_dir, pid, mapping_start,
-                                 size, region_size):
+def validate_block_cache_images(pre_dir, dump_dir, pid, mapping_start,
+                                size, block_size):
     pre_entries = load_pagemap_entries(pre_dir, pid)
     final_entries = load_pagemap_entries(dump_dir, pid)
-    return analyze_partial_region_reads(
-        pre_entries, final_entries, mapping_start, size, region_size)
+    return analyze_partial_block_reads(
+        pre_entries, final_entries, mapping_start, size, block_size)
 
 
 def page_bytes(kind, index):
@@ -469,8 +470,8 @@ def signal_and_wait(pid, signum, path, timeout=120):
     wait_for_path(path, timeout)
 
 
-def run_trial(criu, size, region_size, expected, root, keep_workdirs):
-    workdir = tempfile.mkdtemp(prefix="region-cache-", dir=root)
+def run_trial(criu, size, block_size, expected, root, keep_workdirs):
+    workdir = tempfile.mkdtemp(prefix="block-cache-", dir=root)
     pre_dir = os.path.join(workdir, "img", "pre")
     dump_dir = os.path.join(workdir, "img", "dump")
     proc = None
@@ -486,8 +487,8 @@ def run_trial(criu, size, region_size, expected, root, keep_workdirs):
         pre_cmd = [
             criu, "--no-default-config", "pre-dump", "-t", str(pid), "-D", pre_dir,
             "-o", "pre-dump.log", "-v4", "--shell-job",
-            "--track-mem", "-R", "--compress-region",
-            str(region_size),
+            "--track-mem", "-R", "--compress-block",
+            str(block_size),
         ]
         pre_dump_s = run_cmd(pre_cmd)
 
@@ -497,7 +498,7 @@ def run_trial(criu, size, region_size, expected, root, keep_workdirs):
             criu, "--no-default-config", "dump", "-t", str(pid), "-D", dump_dir,
             "-o", "dump.log", "-v4", "--shell-job",
             "--prev-images-dir=../pre", "--track-mem",
-            "--compress-region", str(region_size),
+            "--compress-block", str(block_size),
         ]
         dump_s = run_cmd(dump_cmd)
         try:
@@ -506,8 +507,8 @@ def run_trial(criu, size, region_size, expected, root, keep_workdirs):
             raise TrialError("workload survived final dump")
         _runtime.active_pids.discard(proc.pid)
 
-        cache_evidence = validate_region_cache_images(
-            pre_dir, dump_dir, pid, mapping_start, size, region_size)
+        cache_evidence = validate_block_cache_images(
+            pre_dir, dump_dir, pid, mapping_start, size, block_size)
         pid = None
 
         restore_pidfile = os.path.join(workdir, "restore.pid")
@@ -646,10 +647,10 @@ def write_results(path, data):
         speedup = (base_med / cached_med - 1) * 100
 
     lines = [
-        "# Region-compressed parent restore benchmark",
+        "# Block-compressed parent restore benchmark",
         "",
         f"Workload: {data['config']['size']} anonymous mapping, every other page modified after pre-dump.",
-        f"Region size: {data['config']['region_size']}",
+        f"Block size: {data['config']['block_size']}",
         f"Iterations: {data['config']['iterations']} measured, {data['config']['warmups']} warmup",
         f"Kernel: {data['system'].get('kernel', 'unknown')} ({data['system'].get('arch', 'unknown')})",
         f"CPU: {data['system'].get('cpu', 'unknown')}",
@@ -665,7 +666,7 @@ def write_results(path, data):
             f"{fmt_sec(summary['restore_p25_s'])}..{fmt_sec(summary['restore_p75_s'])} | "
             f"{summary['count']} |"
         )
-    lines += ["", "Baseline: CRIU without region cache", "Cached: CRIU with region cache"]
+    lines += ["", "Baseline: CRIU without block cache", "Cached: CRIU with block cache"]
     lines += ["", "Restore speedup: " + (f"{speedup:.1f}%" if speedup is not None else "n/a")]
     lines += ["", "Measured restore times:"]
     for label, display in (("without_cache", "without cache"), ("cached", "cached")):
@@ -674,13 +675,13 @@ def write_results(path, data):
     lines += ["", "Commands:"]
     lines.append(
         "```sh\n"
-        f"python3 contrib/compression-benchmark/region-cache.py "
+        f"python3 contrib/compression-benchmark/block-cache.py "
         f"--without-cache-criu {data['criu']['without_cache']['path']} "
         f"--cached-criu {data['criu']['cached']['path']} "
         f"--iterations {data['config']['iterations']} "
         f"--warmups {data['config']['warmups']} "
         f"--size {data['config']['size']} "
-        f"--region-size {data['config']['region_size']} "
+        f"--block-size {data['config']['block_size']} "
         f"--output {path}\n"
         "```"
     )
@@ -702,23 +703,23 @@ def write_results(path, data):
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--without-cache-criu", required=True,
-                help="CRIU binary without the region cache")
+                help="CRIU binary without the block cache")
     parser.add_argument("--cached-criu", default=DEFAULT_CRIU,
-                help="CRIU binary with the region cache")
+                help="CRIU binary with the block cache")
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--size", type=parse_size, default=parse_size("512M"))
-    parser.add_argument("--region-size", type=parse_size,
+    parser.add_argument("--block-size", type=parse_size,
                 default=parse_size("1M"))
-    parser.add_argument("--output", default="region-cache-results.md")
+    parser.add_argument("--output", default="block-cache-results.md")
     parser.add_argument("--tmpdir", default=None)
     parser.add_argument("--keep-workdirs", action="store_true")
     args = parser.parse_args(argv)
 
     if args.iterations <= 0 or args.warmups < 0:
         parser.error("iterations must be > 0 and warmups must be >= 0")
-    if args.region_size > MAX_REGION_SIZE:
-        parser.error(f"--region-size must not exceed {MAX_REGION_SIZE}")
+    if args.block_size > MAX_BLOCK_SIZE:
+        parser.error(f"--block-size must not exceed {MAX_BLOCK_SIZE}")
 
     try:
         load_pycriu()
@@ -735,8 +736,8 @@ def main(argv):
             "warmups": args.warmups,
             "size": fmt_size(args.size),
             "size_bytes": args.size,
-            "region_size": fmt_size(args.region_size),
-            "region_size_bytes": args.region_size,
+            "block_size": fmt_size(args.block_size),
+            "block_size_bytes": args.block_size,
         },
         "criu": {
             "without_cache": {
@@ -767,7 +768,7 @@ def main(argv):
             configurations.reverse()
         for order, (label, criu) in enumerate(configurations):
             print(f"{label} iteration {index + 1}/{total}", flush=True)
-            trial = run_trial(criu, args.size, args.region_size, expected, root,
+            trial = run_trial(criu, args.size, args.block_size, expected, root,
                       args.keep_workdirs)
             trial["label"] = label
             trial["iteration"] = index

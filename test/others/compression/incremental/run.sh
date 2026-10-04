@@ -97,7 +97,7 @@ function validate_compression_mode {
 	local mode="$3"
 
 	case "$mode" in
-	plain | page | region) ;;
+	plain | block-4k | block-64k) ;;
 	*) fail "$chain_name: unknown $stage compression mode $mode" ;;
 	esac
 }
@@ -121,8 +121,8 @@ function create_checkpoint_layer {
 	fi
 
 	case "$compression_mode" in
-	page) args+=(--compress) ;;
-	region) args+=(--compress-region=64K) ;;
+	block-4k) args+=(--compress-block=4K) ;;
+	block-64k) args+=(--compress-block=64K) ;;
 	plain) ;;
 	esac
 
@@ -182,9 +182,9 @@ function run_chain {
 	rm -rf "$imgdir"
 }
 
-run_chain "plain-parents-compressed-final" plain page
-run_chain "compressed-parents-plain-final" page plain
-run_chain "plain-parents-region-final" plain region
-run_chain "region-parents-plain-final" region plain
+run_chain "plain-parents-block-4k-final" plain block-4k
+run_chain "block-4k-parents-plain-final" block-4k plain
+run_chain "plain-parents-block-64k-final" plain block-64k
+run_chain "block-64k-parents-plain-final" block-64k plain
 
 echo "Test PASSED"

@@ -3,6 +3,12 @@
 set -eu
 
 root=$(cd -- "$(dirname -- "$0")/../../../.." && pwd)
+page_size=$(getconf PAGESIZE)
+if [ "$page_size" -lt 65536 ] && [ $((65536 % page_size)) -eq 0 ]; then
+	set -- "$page_size" 65536
+else
+	set -- "$page_size"
+fi
 
 : "${VLLM_CPU_IMAGE:=vllm/vllm-openai-cpu:latest-x86_64}"
 : "${VLLM_CPU_MODEL:=Qwen/Qwen2.5-0.5B-Instruct}"
@@ -18,8 +24,8 @@ timeout --foreground --kill-after=60s 3600s python3 \
 	--image "$VLLM_CPU_IMAGE" \
 	--model "$VLLM_CPU_MODEL" \
 	--iterations 1 \
-	--modes uncompressed lz4-page lz4-region \
-	--region-sizes 65536 \
+	--modes uncompressed lz4-block \
+	--block-sizes "$@" \
 	--decompress-threads 4 \
 	--archive-compression none \
 	--cpu-kvcache-space 1 \

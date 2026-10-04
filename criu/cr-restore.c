@@ -25,6 +25,13 @@
 
 #include "linux/rseq.h"
 
+#ifdef __has_include
+#if __has_include("sys/rseq.h")
+#include <sys/rseq.h>
+#include "asm/thread_pointer.h"
+#endif
+#endif
+
 #include "clone-noasan.h"
 #include "cr_options.h"
 #include "servicefd.h"
@@ -1773,6 +1780,11 @@ static int attach_to_tasks(bool root_seized)
 				return -1;
 			}
 		}
+
+		if (item == root_item && fault_injected(FI_RESTORE_ATTACH)) {
+			pr_err("fault injection: attach failure after the root task\n");
+			return -1;
+		}
 	}
 	for_each_pstree_item(item) {
 		int status, i;
@@ -1926,7 +1938,7 @@ static void finalize_restore(void)
 			continue;
 
 		/* Unmap the restorer blob */
-		ctl = compel_prepare_noctx(pid);
+		ctl = compel_prepare_noctx(pid, false);
 		if (ctl == NULL)
 			continue;
 
@@ -2189,8 +2201,8 @@ static int restore_root_task(struct pstree_item *init)
 	__restore_switch_stage(CR_STATE_FORKING);
 
 skip_ns_bouncing:
-	ret = run_plugins(POST_FORKING);
-	if (ret < 0 && ret != -ENOTSUP)
+	ret = run_plugins_all(POST_FORKING);
+	if (ret && ret != -ENOTSUP)
 		goto out_kill;
 
 	ret = restore_wait_inprogress_tasks();
@@ -2268,7 +2280,8 @@ skip_ns_bouncing:
 	 * Network is unlocked. If something fails below - we lose data
 	 * or a connection.
 	 */
-	attach_to_tasks(root_seized);
+	if (attach_to_tasks(root_seized))
+		goto out_kill_network_unlocked;
 
 	if (restore_switch_stage(CR_STATE_RESTORE_CREDS))
 		goto out_kill_network_unlocked;
@@ -2302,6 +2315,11 @@ skip_ns_bouncing:
 	if (restore_rseq_cs())
 		pr_err("Unable to restore rseq_cs state\n");
 
+	if (fault_injected(FI_RESTORE_LATE)) {
+		pr_err("fault injection: late restore failure\n");
+		goto out_kill_network_unlocked;
+	}
+
 	/*
 	 * Some external devices such as GPUs might need a very late
 	 * trigger to kick-off some events, memory notifiers and for
@@ -2316,9 +2334,14 @@ skip_ns_bouncing:
 		if (!task_alive(item))
 			continue;
 		ret = run_plugins(RESUME_DEVICES_LATE, item->pid->real);
-		/* Missing hooks are optional; a device restore failure is fatal. */
-		if (ret < 0 && ret != -ENOTSUP) {
-			pr_err("Late device restore failed for PID %d: %d\n", item->pid->real, ret);
+		/*
+		 * -ENOTSUP means that no plugin claimed this task and is expected
+		 * for tasks without external device state. Any other value is a
+		 * restore failure. The plugin should report details and CRIU must
+		 * not resume a partially restored task.
+		 */
+		if (ret && ret != -ENOTSUP) {
+			pr_err("Device hook failed for pid %d, ret %d\n", item->pid->real, ret);
 			goto out_kill_network_unlocked;
 		}
 	}
@@ -2358,14 +2381,32 @@ out_kill:
 	 * otherwise an external processes can be killed.
 	 */
 	if (vpid(root_item) == INIT_PID) {
+		pid_t init_pid = root_item->pid->real;
+		siginfo_t info;
 		int status;
+		pid_t pid;
+
+		/* The SIGCHLD handler must not collect init behind our back */
+		ignore_kids();
 
 		/* Kill init */
-		if (root_item->pid->real > 0)
-			kill(root_item->pid->real, SIGKILL);
+		if (init_pid > 0)
+			kill(init_pid, SIGKILL);
 
-		if (waitpid(root_item->pid->real, &status, 0) < 0)
-			pr_warn("Unable to wait %d: %s\n", root_item->pid->real, strerror(errno));
+		/*
+		 * Init finishes exiting only after the rest of its pid namespace
+		 * is collected, and only we can collect a zombie we trace. So
+		 * collect anything until init exits, if init is still ours.
+		 */
+		if (!waitid(P_PID, init_pid, &info, WEXITED | WNOHANG | WNOWAIT | __WALL)) {
+			do {
+				pid = waitpid(-1, &status, __WALL);
+			} while (pid > 0 && (pid != init_pid || WIFSTOPPED(status)));
+		} else {
+			pid = waitpid(init_pid, &status, 0);
+		}
+		if (pid < 0)
+			pr_warn("Unable to wait %d: %s\n", init_pid, strerror(errno));
 	} else {
 		struct pstree_item *pi;
 
@@ -3415,8 +3456,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		unsigned int n;
 
 		for (n = 0; n < task_args->vma_ios_n; n++) {
-			if (rio->compressed_size)
-				RST_MEM_FIXUP_PPTR(rio->compressed_size);
+			if (rio->b_layout.sizes)
+				RST_MEM_FIXUP_PPTR(rio->b_layout.sizes);
 			if (rio->block_pages)
 				RST_MEM_FIXUP_PPTR(rio->block_pages);
 			rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs));

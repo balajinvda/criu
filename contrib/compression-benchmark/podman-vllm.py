@@ -13,7 +13,7 @@ reflects CRIU image size rather than tar-level gzip/zstd compression.
 Example:
   sudo HF_TOKEN=... python3 contrib/compression-benchmark/podman-vllm.py \\
        --model Qwen/Qwen3-0.6B -n 3 \\
-       --modes uncompressed lz4-page lz4-region
+       --modes uncompressed lz4-block --block-sizes 4096 262144
 
 CPU-only example:
   sudo python3 contrib/compression-benchmark/podman-vllm.py \\

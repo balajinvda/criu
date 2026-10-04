@@ -41,7 +41,7 @@ function check_rejected {
 		fail "$name did not report the page-server compression error"
 }
 
-function check_invalid_region {
+function check_invalid_block {
 	local value="$1"
 	local status
 
@@ -49,15 +49,15 @@ function check_invalid_region {
 	set +e
 	timeout --foreground --kill-after=1s 5s \
 		"${CRIU}" page-server --no-default-config -D . \
-		--port 54321 --compress-region="$value" > "$LOG" 2>&1
+		--port 54321 --compress-block="$value" > "$LOG" 2>&1
 	status=$?
 	set -e
 
 	if [ "$status" -ne 1 ]; then
-		fail "malformed region '$value' returned $status"
+		fail "malformed block '$value' returned $status"
 	fi
-	grep -q "Invalid --compress-region" "$LOG" || \
-		fail "malformed region '$value' was not rejected by its parser"
+	grep -q "Invalid --compress-block" "$LOG" || \
+		fail "malformed block '$value' was not rejected by its parser"
 }
 
 function check_invalid_threads {
@@ -104,12 +104,12 @@ function check_valid_threads {
 
 check_rejected compress --compress
 check_rejected acceleration --compress-acceleration 2
-check_rejected region --compress-region 64K
-check_invalid_region 64Kjunk
-check_invalid_region 64MgarbageK
-check_invalid_region 64KB
-check_invalid_region -64K
-check_invalid_region 18446744073709551616K
+check_rejected block --compress-block 64K
+check_invalid_block 64Kjunk
+check_invalid_block 64MgarbageK
+check_invalid_block 64KB
+check_invalid_block -64K
+check_invalid_block 18446744073709551616K
 check_invalid_threads ""
 # Check both special values: 0 selects automatic concurrency and 1, the default, is serial per request.
 check_valid_threads 0 54322

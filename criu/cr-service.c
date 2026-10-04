@@ -42,6 +42,7 @@
 #include "common/scm.h"
 #include "uffd.h"
 #include "pidfd-store.h"
+#include "plugin.h"
 
 #include "setproctitle.h"
 
@@ -332,16 +333,19 @@ static int setup_images_and_workdir(const char *images_dir_path,
 {
 	char work_dir_path[PATH_MAX] = "";
 
+	if (check_stream_conflicts())
+		return -1;
+
 	/* We don't need to open images dir in CHECK mode. */
 	if (opts.mode != CR_CHECK) {
-		/*
-		 * Image streaming is not supported with CRIU's service feature as
-		 * the streamer must be started for each dump/restore operation.
-		 * It is unclear how to do that with RPC, so we punt for now.
-		 * This explains why we provide the argument mode=-1 instead of
-		 * O_RSTR or O_DUMP.
-		 */
-		if (open_image_dir(images_dir_path, -1) < 0) {
+		int mode = image_dir_mode();
+
+		if (opts.stream && mode == -1) {
+			pr_err("Image streaming cannot be used with this request\n");
+			return -1;
+		}
+
+		if (open_image_dir(images_dir_path, mode) < 0) {
 			pr_perror("Can't open images directory");
 			return -1;
 		}
@@ -406,6 +410,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	bool imgs_changed_by_rpc_conf = false;
 	int i;
 	bool dummy = false;
+
+	/* Drop options from a previous request while preserving config defaults. */
+	cr_plugin_options_clear_request();
 
 	if (getsockopt(sk, SOL_SOCKET, SO_PEERCRED, &ids, &ids_len)) {
 		pr_perror("Can't get socket options");
@@ -509,6 +516,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (req->has_auto_dedup)
 		opts.auto_dedup = req->auto_dedup;
+
+	if (req->has_stream)
+		opts.stream = req->stream;
 
 	if (req->has_force_irmap)
 		opts.force_irmap = req->force_irmap;
@@ -805,6 +815,11 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		xfree(tmp_work);
 	}
 
+	for (i = 0; i < req->n_plugin_options; i++) {
+		if (!req->plugin_options[i] || cr_plugin_option_add_arg(req->plugin_options[i]))
+			goto err;
+	}
+
 	if (resolve_images_dir_path(images_dir_path, imgs_changed_by_rpc_conf, req, ids.pid) < 0)
 		goto err;
 
@@ -839,12 +854,13 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		opts.mntns_compat_mode = true;
 
 	if (req->has_compress) {
-		if (req->compress > COMPRESS_REGION) {
+		if (req->compress > COMPRESS_BLOCK) {
 			pr_err("Invalid compress value %u\n", req->compress);
 			goto err;
 		}
-		opts.compress_mode = req->compress;
-		if (req->compress == COMPRESS_OFF) {
+		if (req->compress != COMPRESS_OFF) {
+			opts.compress_mode = COMPRESS_BLOCK;
+		} else {
 			/*
 			 * An explicit RPC setting has precedence over values loaded
 			 * from the service configuration. libcriu clears the related
@@ -852,12 +868,13 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 			 * RPC request which asks for both settings at once.
 			 */
 			if (req->has_compress_acceleration ||
-			    req->has_compress_region_size) {
+			    req->has_compress_block_size) {
 				pr_err("compress=off conflicts with compression tuning options\n");
 				goto err;
 			}
+			opts.compress_mode = COMPRESS_OFF;
 			opts.compress_acceleration = 0;
-			opts.compress_region_size = 0;
+			opts.compress_block_size = 0;
 		}
 	}
 
@@ -869,22 +886,23 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 			goto err;
 		}
 		opts.compress_acceleration = req->compress_acceleration;
+		if (!req->has_compress_block_size &&
+		    !req->has_compress) {
+			opts.compress_mode = COMPRESS_BLOCK;
+			opts.compress_block_size = PAGE_SIZE;
+		}
 	}
 
-	if (req->has_compress_region_size) {
-		if (req->compress_region_size == 0 ||
-		    req->compress_region_size % PAGE_SIZE != 0 ||
-		    req->compress_region_size > MAX_REGION_SIZE) {
-			pr_err("Invalid compress_region_size value %u\n",
-			       req->compress_region_size);
+	if (req->has_compress_block_size) {
+		if (req->compress_block_size == 0 ||
+		    req->compress_block_size % PAGE_SIZE != 0 ||
+		    req->compress_block_size > MAX_BLOCK_SIZE) {
+			pr_err("Invalid compress_block_size value %u\n",
+			       req->compress_block_size);
 			goto err;
 		}
-		if (opts.compress_mode == COMPRESS_PER_PAGE) {
-			pr_err("compress_region_size conflicts with compress=per-page\n");
-			goto err;
-		}
-		opts.compress_region_size = req->compress_region_size;
-		opts.compress_mode = COMPRESS_REGION;
+		opts.compress_block_size = req->compress_block_size;
+		opts.compress_mode = COMPRESS_BLOCK;
 	}
 
 	if (req->has_decompress_threads) {
@@ -1671,7 +1689,8 @@ int cr_service(bool daemon_mode)
 				exit(1);
 
 			close(server_fd);
-			init_opts();
+			if (init_opts())
+				exit(1);
 			ret = cr_service_work(sk);
 			close(sk);
 			exit(ret != 0);
