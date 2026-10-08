@@ -138,6 +138,7 @@ enum criu_mode {
 	CR_DEDUP,
 	CR_CPUINFO_DUMP,
 	CR_CPUINFO_CHECK,
+	CR_NET_UNLOCK,
 	CR_EXEC_DEPRECATED,
 	CR_SHOW_DEPRECATED,
 };
@@ -208,6 +209,7 @@ struct cr_options {
 	bool lazy_pages;
 	char *work_dir;
 	int network_lock_method;
+	int keep_network_lock;
 	int skip_file_rwx_check;
 	int allow_uprobes;
 

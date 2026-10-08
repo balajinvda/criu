@@ -1,6 +1,8 @@
 #ifndef __CR_NETFILTER_H__
 #define __CR_NETFILTER_H__
 
+#include <stdbool.h>
+
 #include "compel/infect-util.h"
 
 /*
@@ -20,8 +22,9 @@ extern int iptables_unlock_connection_info(struct inet_sk_info *);
 
 extern void preload_netfilter_modules(void);
 
-extern int nftables_init_connection_lock(void);
+extern int nftables_init_connection_lock(bool restore);
 extern int nftables_lock_connection(struct inet_sk_desc *);
+extern int nftables_lock_connection_info(struct inet_sk_info *);
 extern int nftables_get_table(char *table, int n);
 
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0)

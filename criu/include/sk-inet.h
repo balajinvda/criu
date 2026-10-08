@@ -66,6 +66,7 @@ struct inet_sk_info {
 };
 
 extern int inet_bind(int sk, struct inet_sk_info *);
+extern int inet_addr_map_add(char *arg);
 extern int inet_connect(int sk, struct inet_sk_info *);
 
 #ifdef CR_NOGLIBC

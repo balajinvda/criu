@@ -815,6 +815,22 @@ The 'mode' may be one of the following:
     Required when dumped with this option. Refer to this option in the section
     on dumping for more details.
 
+*--inet-addr-map* 'old'='new'[,'old'='new'...]::
+    Replace address 'old' with 'new' in all restored inet sockets, both as
+    local and as peer address. Use it to move TCP connections to a host or
+    container with a different IP address; restore every end of a connection
+    with the same map. An IPv4 entry also matches the IPv4-mapped IPv6 form.
+    The option can be given more than once.
+
+*--keep-network-lock*::
+    Keep the restored TCP connections locked when the restore finishes,
+    until *criu net-unlock* is run. The connections are locked on the
+    restore host as well, so that they stay locked when restored on another
+    host. Use it when the ends of connections are restored separately, and
+    release the lock only after all of them are restored. Needs images dumped
+    with *--network-lock nftables*, and does not support restoring a network
+    namespace.
+
 *check*
 ~~~~~~~
 Checks whether the kernel supports the features needed by *criu* to
@@ -949,6 +965,11 @@ dedup
 Starts pagemap data deduplication procedure, where *criu* scans over all
 pagemap files and tries to minimize the number of pagemap entries by
 obtaining the references from a parent pagemap image.
+
+net-unlock
+~~~~~~~~~~
+Releases the network lock left by *restore --keep-network-lock* for the
+images in *-D*. Run it in the network namespace of the restored tasks.
 
 cpuinfo dump
 ~~~~~~~~~~~~

@@ -67,6 +67,7 @@ struct {
 	{ "service", CR_SERVICE },
 	{ "swrk", CR_SWRK },
 	{ "dedup", CR_DEDUP },
+	{ "net-unlock", CR_NET_UNLOCK },
 	{ "exec", CR_EXEC_DEPRECATED },
 	{ "show", CR_SHOW_DEPRECATED },
 };
@@ -336,6 +337,9 @@ int main(int argc, char *argv[], char *envp[])
 	case CR_CPUINFO_CHECK:
 		return cpuinfo_check();
 
+	case CR_NET_UNLOCK:
+		return cr_net_unlock() != 0;
+
 	case CR_EXEC_DEPRECATED:
 		pr_err("The \"exec\" action is deprecated by the Compel library.\n");
 		return -1;
@@ -358,6 +362,7 @@ usage:
 	       "  criu page-server\n"
 	       "  criu service [<options>]\n"
 	       "  criu dedup\n"
+	       "  criu net-unlock -D DIR\n"
 	       "  criu lazy-pages -D DIR [<options>]\n"
 	       "\n"
 	       "Commands:\n"
@@ -369,7 +374,8 @@ usage:
 	       "  service        launch service\n"
 	       "  dedup          remove duplicates in memory dump\n"
 	       "  cpuinfo dump   writes cpu information into image file\n"
-	       "  cpuinfo check  validates cpu information read from image file\n");
+	       "  cpuinfo check  validates cpu information read from image file\n"
+	       "  net-unlock     release the network lock kept by restore --keep-network-lock\n");
 
 	if (usage_error) {
 		pr_msg("\nTry -h|--help for more info\n");
@@ -411,6 +417,11 @@ usage:
 	       "                        based on MOVE_MOUNT_SET_GROUP kernel feature\n"
 	       "  --network-lock METHOD network locking/unlocking method; argument\n"
 	       "                        can be 'nftables' or 'iptables' (default).\n"
+	       "  --keep-network-lock   on restore, keep the restored TCP connections locked\n"
+	       "                        (nftables only) until 'criu net-unlock -D DIR'\n"
+	       "  --inet-addr-map OLD=NEW[,OLD=NEW...]\n"
+	       "                        on restore, replace address OLD with NEW in all\n"
+	       "                        inet sockets (e.g. a pod moved to a new IP)\n"
 	       "  --unprivileged        accept limitations when running as non-root\n"
 	       "  --allow-uprobes       allow dump/restore with uprobes vma\n"
 	       "\n"
