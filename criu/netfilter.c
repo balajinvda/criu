@@ -153,7 +153,7 @@ int iptables_unlock_connection_info(struct inet_sk_info *si)
 	return ret;
 }
 
-int nftables_init_connection_lock(void)
+int nftables_init_connection_lock(bool restore)
 {
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
 	struct nft_ctx *nft;
@@ -168,8 +168,12 @@ int nftables_init_connection_lock(void)
 		return -1;
 
 	snprintf(buf, sizeof(buf), "create table %s", table);
-	if (NFT_RUN_CMD(nft, buf))
+	if (NFT_RUN_CMD(nft, buf)) {
+		/* Restoring on the dump host: the dump's lock is still there */
+		if (restore && errno == EEXIST)
+			goto out;
 		goto err2;
+	}
 
 	snprintf(buf, sizeof(buf), "add chain %s output { type filter hook output priority 0; }", table);
 	if (NFT_RUN_CMD(nft, buf))
@@ -295,6 +299,23 @@ int nftables_lock_connection(struct inet_sk_desc *sk)
 	ret = nftables_lock_connection_raw(sk->sd.family, sk->dst_addr, sk->dst_port, sk->src_addr, sk->src_port);
 
 	return ret;
+}
+
+int nftables_lock_connection_info(struct inet_sk_info *si)
+{
+	static bool table_ready;
+	InetSkEntry *ie = si->ie;
+
+	if (!table_ready) {
+		if (nftables_init_connection_lock(true))
+			return -1;
+		table_ready = true;
+	}
+
+	if (nftables_lock_connection_raw(ie->family, ie->src_addr, ie->src_port, ie->dst_addr, ie->dst_port))
+		return -1;
+
+	return nftables_lock_connection_raw(ie->family, ie->dst_addr, ie->dst_port, ie->src_addr, ie->src_port);
 }
 
 int nftables_get_table(char *table, int n)

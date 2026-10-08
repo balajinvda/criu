@@ -759,6 +759,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "pre-dump-mode", required_argument, 0, 1097 },
 		{ "file-validation", required_argument, 0, 1098 },
 		BOOL_OPT("skip-file-rwx-check", &opts.skip_file_rwx_check),
+		BOOL_OPT("keep-network-lock", &opts.keep_network_lock),
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
 		{ "image-io-mode", required_argument, 0, 1101 },
@@ -772,6 +773,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "compress-block", required_argument, 0, 1103 },
 		{ "decompress-threads", required_argument, 0, 1104 },
 		{ "plugin-option", required_argument, 0, 1105 },
+		{ "inet-addr-map", required_argument, 0, 1106 },
 		{},
 	};
 
@@ -928,6 +930,10 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		}
 		case 1105:
 			if (cr_plugin_option_add_arg(optarg))
+				return 1;
+			break;
+		case 1106:
+			if (inet_addr_map_add(optarg))
 				return 1;
 			break;
 		case 1043: {

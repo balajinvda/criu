@@ -2267,7 +2267,10 @@ skip_ns_bouncing:
 		goto out_kill;
 
 	/* Unlock network before disabling repair mode on sockets */
-	network_unlock();
+	if (opts.keep_network_lock)
+		pr_info("Network stays locked until criu net-unlock\n");
+	else
+		network_unlock();
 
 	/*
 	 * Stop getting sigchld, after we resume the tasks they
@@ -2470,6 +2473,11 @@ int cr_restore_tasks(void)
 	if (check_img_inventory(/* restore = */ true) < 0)
 		return -1;
 
+	if (opts.keep_network_lock && opts.network_lock_method != NETWORK_LOCK_NFTABLES) {
+		pr_err("--keep-network-lock needs images dumped with --network-lock nftables\n");
+		return -1;
+	}
+
 	if (init_stats(RESTORE_STATS))
 		return -1;
 
@@ -2497,6 +2505,11 @@ int cr_restore_tasks(void)
 
 	if (prepare_pstree() < 0)
 		return -1;
+
+	if (opts.keep_network_lock && (root_ns_mask & CLONE_NEWNET)) {
+		pr_err("--keep-network-lock does not support restoring a network namespace\n");
+		return -1;
+	}
 
 	if (fdstore_init())
 		return -1;

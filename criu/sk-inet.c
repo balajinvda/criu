@@ -32,6 +32,7 @@
 #include "rst-malloc.h"
 #include "sockets.h"
 #include "sk-inet.h"
+#include "netfilter.h"
 #include "protobuf.h"
 #include "util.h"
 #include "namespaces.h"
@@ -709,6 +710,67 @@ static inline int tcp_connection(InetSkEntry *ie)
 	return (ie->proto == IPPROTO_TCP && ie->dst_port);
 }
 
+/* --inet-addr-map: addresses replaced in restored inet sockets */
+struct inet_addr_map {
+	int family;
+	u32 from[4];
+	u32 to[4];
+};
+
+static struct inet_addr_map *addr_map;
+static int n_addr_map;
+
+int inet_addr_map_add(char *arg)
+{
+	char *pair, *eq, *save = NULL;
+
+	for (pair = strtok_r(arg, ",", &save); pair; pair = strtok_r(NULL, ",", &save)) {
+		struct inet_addr_map *m;
+
+		if (xrealloc_safe(&addr_map, (n_addr_map + 1) * sizeof(*addr_map)))
+			return -1;
+		m = &addr_map[n_addr_map];
+		memset(m, 0, sizeof(*m));
+		m->family = strchr(pair, ':') ? AF_INET6 : AF_INET;
+
+		eq = strchr(pair, '=');
+		if (!eq) {
+			pr_err("Bad --inet-addr-map entry %s, want OLD=NEW\n", pair);
+			return -1;
+		}
+		*eq = '\0';
+		if (inet_pton(m->family, pair, m->from) != 1 || inet_pton(m->family, eq + 1, m->to) != 1) {
+			pr_err("Bad --inet-addr-map address in %s=%s\n", pair, eq + 1);
+			return -1;
+		}
+		n_addr_map++;
+	}
+	return 0;
+}
+
+static bool inet_addr_remap(u32 *addr, size_t n)
+{
+	int i;
+
+	for (i = 0; i < n_addr_map; i++) {
+		struct inet_addr_map *m = &addr_map[i];
+		size_t len = m->family == AF_INET ? 1 : 4;
+		u32 *a = addr;
+
+		/* An IPv4 entry also matches the IPv4-mapped IPv6 form */
+		if (m->family == AF_INET && n == 4 && !addr[0] && !addr[1] && addr[2] == htonl(0xffff))
+			a = &addr[3];
+		else if (n != len)
+			continue;
+
+		if (memcmp(a, m->from, len * sizeof(u32)))
+			continue;
+		memcpy(a, m->to, len * sizeof(u32));
+		return true;
+	}
+	return false;
+}
+
 static int collect_one_inetsk(void *o, ProtobufCMessage *base, struct cr_img *i)
 {
 	struct inet_sk_info *ii = o;
@@ -716,12 +778,24 @@ static int collect_one_inetsk(void *o, ProtobufCMessage *base, struct cr_img *i)
 
 	ii->ie = pb_msg(base, InetSkEntry);
 
+	if (inet_addr_remap(ii->ie->src_addr, ii->ie->n_src_addr) |
+	    inet_addr_remap(ii->ie->dst_addr, ii->ie->n_dst_addr))
+		pr_info("Remapped addresses of inet socket %#x\n", ii->ie->id);
+
 	ret = run_plugins(UPDATE_INETSK, ii->ie->family, ii->ie->state, ii->ie->src_addr, ii->ie->dst_addr);
 	if (ret < 0 && ret != -ENOTSUP)
 		return -1;
 
-	if (tcp_connection(ii->ie))
+	if (tcp_connection(ii->ie)) {
 		tcp_locked_conn_add(ii);
+		/*
+		 * The dump's lock exists only on the dump host. Lock the
+		 * connection here as well, so that it stays locked until
+		 * criu net-unlock, wherever the restore runs.
+		 */
+		if (opts.keep_network_lock && nftables_lock_connection_info(ii))
+			return -1;
+	}
 
 	/*
 	 * A socket can reuse addr only if all previous sockets allow that,

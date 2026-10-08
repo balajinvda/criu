@@ -43,6 +43,8 @@
 #include "sysctl.h"
 #include "kerndat.h"
 #include "util.h"
+#include "crtools.h"
+#include "servicefd.h"
 #include "external.h"
 #include "fdstore.h"
 #include "netfilter.h"
@@ -3599,7 +3601,7 @@ int network_lock(void)
 	/* Each connection will be locked on dump */
 	if (!(root_ns_mask & CLONE_NEWNET)) {
 		if (opts.network_lock_method == NETWORK_LOCK_NFTABLES)
-			nftables_init_connection_lock();
+			nftables_init_connection_lock(false);
 		return 0;
 	}
 
@@ -3623,6 +3625,28 @@ void network_unlock(void)
 	} else if (opts.network_lock_method == NETWORK_LOCK_NFTABLES) {
 		nftables_network_unlock();
 	}
+}
+
+/* criu net-unlock: release the lock left by restore --keep-network-lock */
+int cr_net_unlock(void)
+{
+	if (init_service_fd())
+		return -1;
+
+	if (check_img_inventory(/* restore = */ true) < 0)
+		return -1;
+
+	if (opts.network_lock_method != NETWORK_LOCK_NFTABLES) {
+		pr_err("net-unlock needs images dumped with --network-lock nftables\n");
+		return -1;
+	}
+
+	if (dump_criu_run_id[0] == NO_DUMP_CRIU_RUN_ID) {
+		pr_err("The images have no dump run id to name the lock table\n");
+		return -1;
+	}
+
+	return nftables_network_unlock();
 }
 
 int veth_pair_add(char *in, char *out)
