@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
@@ -19,6 +20,7 @@
 #include "rst-malloc.h"
 #include "pstree.h"
 #include "log.h"
+#include "util.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "io_uring: "
@@ -67,6 +69,43 @@ struct io_uring_info {
 
 static LIST_HEAD(rst_io_urings);
 
+/*
+ * An SQPOLL ring gets its poller thread when it is created, and the kernel
+ * gives that thread the next free id of the pid namespace. Files are restored
+ * before the task's threads are recreated, so in a fresh pid namespace that
+ * id is one the image still has to restore, and creating that thread later
+ * fails with EEXIST. Move the namespace's last pid past every id the image
+ * restores, so the poller takes an id no restored task or thread needs.
+ */
+static int sqpoll_thread_past_restored_ids(void)
+{
+	struct pstree_item *pi;
+	pid_t max = 0;
+	char buf[32];
+	int fd, len, i;
+
+	for_each_pstree_item(pi) {
+		if (vpid(pi) > max)
+			max = vpid(pi);
+		for (i = 0; i < pi->nr_threads; i++)
+			if (pi->threads[i].ns[0].virt > max)
+				max = pi->threads[i].ns[0].virt;
+	}
+
+	fd = open_proc_rw(PROC_GEN, LAST_PID_PATH);
+	if (fd < 0)
+		return -1;
+	len = snprintf(buf, sizeof(buf), "%d", max);
+	if (write(fd, buf, len) != len) {
+		pr_perror("io_uring: can't set /proc/%s to %d", LAST_PID_PATH, max);
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	pr_info("io_uring: SQPOLL thread ids start past %d\n", max);
+	return 0;
+}
+
 static int io_uring_open(struct file_desc *d, int *new_fd)
 {
 	struct io_uring_info *info;
@@ -81,6 +120,9 @@ static int io_uring_open(struct file_desc *d, int *new_fd)
 	p.flags = ioure->setup_flags;
 
 	pr_info("Creating io_uring id %#x sq_entries %u flags %#x\n", ioure->id, ioure->sq_entries, ioure->setup_flags);
+
+	if ((p.flags & IORING_SETUP_SQPOLL) && sqpoll_thread_past_restored_ids())
+		return -1;
 
 	tmp = syscall(__NR_io_uring_setup, ioure->sq_entries, &p);
 	if (tmp < 0) {
