@@ -1294,6 +1294,12 @@ static int dump_zombies(void)
 			} else if (fill_zombies_pids(item->parent))
 				goto err;
 		}
+		/*
+		 * A zombie has one thread, its leader, and no parasite fills its
+		 * id in (dump_task_threads() does that for live tasks): without
+		 * this the pstree image carries whatever the thread array held.
+		 */
+		item->threads[0].ns[0].virt = vpid(item);
 
 		pr_info("Obtaining zombie stat ... \n");
 		if (parse_pid_stat(vpid(item), &pps_buf) < 0)
