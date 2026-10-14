@@ -84,10 +84,16 @@ static int sqpoll_thread_past_restored_ids(void)
 	char buf[32];
 	int fd, len, i;
 
+	/*
+	 * As restore reads the pstree image: a task's leader is its pid, and
+	 * only the other threads take their ids from the thread list (images
+	 * of zombies dumped before the dump filled their leader in carry an
+	 * arbitrary value there).
+	 */
 	for_each_pstree_item(pi) {
 		if (vpid(pi) > max)
 			max = vpid(pi);
-		for (i = 0; i < pi->nr_threads; i++)
+		for (i = 1; i < pi->nr_threads; i++)
 			if (pi->threads[i].ns[0].virt > max)
 				max = pi->threads[i].ns[0].virt;
 	}
