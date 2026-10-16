@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -96,6 +97,26 @@ static int sqpoll_thread_past_restored_ids(void)
 		for (i = 1; i < pi->nr_threads; i++)
 			if (pi->threads[i].ns[0].virt > max)
 				max = pi->threads[i].ns[0].virt;
+	}
+
+	/*
+	 * A restore into a running pid namespace (the target's own, whose
+	 * next id the caller raised past the restored range) needs no write:
+	 * the poller already takes an id above every restored one. Writing
+	 * would lower that id, and the namespace's /proc/sys may be mounted
+	 * read-only there (a container's is).
+	 */
+	fd = open_proc(PROC_GEN, LAST_PID_PATH);
+	if (fd >= 0) {
+		len = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (len > 0) {
+			buf[len] = '\0';
+			if (atoi(buf) >= max) {
+				pr_info("io_uring: SQPOLL thread ids already start past %d (last pid %d)\n", max, atoi(buf));
+				return 0;
+			}
+		}
 	}
 
 	fd = open_proc_rw(PROC_GEN, LAST_PID_PATH);
