@@ -1,6 +1,8 @@
 #include <time.h>
 #include <sched.h>
 #include <stdbool.h>
+#include <errno.h>
+#include <inttypes.h>
 
 #include "types.h"
 #include "proc_parse.h"
@@ -134,6 +136,22 @@ int prepare_timens(int id)
 	if (ret < 0)
 		goto err;
 
+	if (opts.timens_budget_ms) {
+		/* timens_wait_dumped_clocks() resumes the tasks when they reach the dumped values. */
+		int64_t sec = opts.timens_budget_ms / 1000;
+		long nsec = (opts.timens_budget_ms % 1000) * 1000000L;
+		struct timespec m = { te->monotonic->tv_sec - sec, te->monotonic->tv_nsec - nsec };
+		struct timespec b = { te->boottime->tv_sec - sec, te->boottime->tv_nsec - nsec };
+
+		normalize_timespec(&m);
+		normalize_timespec(&b);
+		te->monotonic->tv_sec = m.tv_sec;
+		te->monotonic->tv_nsec = m.tv_nsec;
+		te->boottime->tv_sec = b.tv_sec;
+		te->boottime->tv_nsec = b.tv_nsec;
+		pr_info("timens: clocks start %u ms behind the dumped values\n", opts.timens_budget_ms);
+	}
+
 	if (unshare(CLONE_NEWTIME)) {
 		pr_perror("Unable to create a new time namespace");
 		return -1;
@@ -190,5 +208,71 @@ err:
 	close_safe(&fd);
 	return exit_code;
 }
+static int64_t ts_ns(const struct timespec *ts)
+{
+	return (int64_t)ts->tv_sec * NSEC_PER_SEC + ts->tv_nsec;
+}
+
+/*
+ * With --timens-budget the restored clocks started behind the dumped values
+ * (prepare_timens). Keep the tasks stopped until their monotonic clock has
+ * reached the dumped value, so it continues from there and never reads
+ * earlier than it did before the dump. A restore longer than the budget
+ * resumes them at once; only the overrun counts as time they ran.
+ */
+int timens_wait_dumped_clocks(pid_t root, int ns_id)
+{
+	struct timespec moff_self = {}, boff_self = {}, moff_root = {}, boff_root = {}, now;
+	struct cr_img *img;
+	TimensEntry *te = NULL;
+	int64_t target, restored, wait;
+
+	if (!opts.timens_budget_ms || opts.unprivileged)
+		return 0;
+
+	img = open_image(CR_FD_TIMENS, O_RSTR, ns_id);
+	if (!img)
+		goto blind;
+	if (empty_image(img) || pb_read_one(img, &te, PB_TIMENS) < 0) {
+		close_image(img);
+		goto blind;
+	}
+	close_image(img);
+	target = (int64_t)te->monotonic->tv_sec * NSEC_PER_SEC + te->monotonic->tv_nsec;
+	timens_entry__free_unpacked(te, NULL);
+
+	if (parse_timens_offsets(&boff_self, &moff_self) ||
+	    parse_pid_timens_offsets(root, &boff_root, &moff_root))
+		goto blind;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	restored = ts_ns(&now) - ts_ns(&moff_self) + ts_ns(&moff_root);
+	wait = target - restored;
+	if (wait <= 0) {
+		pr_warn("timens: the restore took %" PRId64 " ms longer than its budget; the tasks see it\n",
+			-wait / 1000000);
+		return 0;
+	}
+	pr_info("timens: resuming the tasks in %" PRId64 " ms, when their clocks reach the dumped values\n",
+		wait / 1000000);
+	now.tv_sec = wait / NSEC_PER_SEC;
+	now.tv_nsec = wait % NSEC_PER_SEC;
+	while (nanosleep(&now, &now) && errno == EINTR)
+		;
+	return 0;
+
+blind:
+	/*
+	 * Without the values, wait out the whole budget: the clocks then read
+	 * at least the dumped values, never earlier ones.
+	 */
+	pr_warn("timens: cannot read the restored clocks; waiting out the whole budget\n");
+	now.tv_sec = opts.timens_budget_ms / 1000;
+	now.tv_nsec = (opts.timens_budget_ms % 1000) * 1000000L;
+	while (nanosleep(&now, &now) && errno == EINTR)
+		;
+	return 0;
+}
+
 struct ns_desc time_ns_desc = NS_DESC_ENTRY(CLONE_NEWTIME, "time");
 struct ns_desc time_for_children_ns_desc = NS_DESC_ENTRY(CLONE_NEWTIME, "time_for_children");

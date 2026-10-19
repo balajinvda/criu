@@ -104,6 +104,7 @@ extern void parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf);
 extern int parse_uptime(uint64_t *upt);
 
 extern int parse_timens_offsets(struct timespec *boff, struct timespec *moff);
+extern int parse_pid_timens_offsets(pid_t pid, struct timespec *boff, struct timespec *moff);
 
 extern bool found_uprobes_vma(void);
 

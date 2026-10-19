@@ -1637,12 +1637,17 @@ static bool should_skip_mount(char *mountpoint)
 
 int parse_timens_offsets(struct timespec *boff, struct timespec *moff)
 {
+	return parse_pid_timens_offsets(PROC_SELF, boff, moff);
+}
+
+int parse_pid_timens_offsets(pid_t pid, struct timespec *boff, struct timespec *moff)
+{
 	int exit_code = -1;
 	FILE *f;
 
-	f = fopen_proc(PROC_SELF, "timens_offsets");
+	f = fopen_proc(pid, "timens_offsets");
 	if (!f) {
-		pr_perror("Unable to open /proc/self/timens_offsets");
+		pr_perror("Unable to open timens_offsets of %d", pid);
 		return exit_code;
 	}
 	while (fgets(buf, BUF_SIZE, f)) {

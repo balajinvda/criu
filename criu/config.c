@@ -774,6 +774,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "decompress-threads", required_argument, 0, 1104 },
 		{ "plugin-option", required_argument, 0, 1105 },
 		{ "inet-addr-map", required_argument, 0, 1106 },
+		{ "timens-budget", required_argument, 0, 1107 },
 		{},
 	};
 
@@ -936,6 +937,17 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			if (inet_addr_map_add(optarg))
 				return 1;
 			break;
+		case 1107: {
+			char *end;
+			unsigned long v = strtoul(optarg, &end, 10);
+
+			if (*optarg == '\0' || *end != '\0' || v > UINT_MAX) {
+				pr_err("Unable to parse value of --timens-budget\n");
+				return 1;
+			}
+			opts.timens_budget_ms = v;
+			break;
+		}
 		case 1043: {
 			int fd;
 

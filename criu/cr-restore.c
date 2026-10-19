@@ -2356,6 +2356,11 @@ skip_ns_bouncing:
 	if (restore_freezer_state())
 		pr_err("Unable to restore freezer state\n");
 
+	/* The tasks are still stopped: their clocks may have to catch up first (timens.c). */
+	if ((root_ns_mask & CLONE_NEWTIME) || kdat.has_timens)
+		timens_wait_dumped_clocks(root_item->pid->real,
+					  (root_ns_mask & CLONE_NEWTIME) ? root_item->ids->time_ns_id : 0);
+
 	/* Detaches from processes and they continue run through sigreturn. */
 	if (finalize_restore_detach())
 		goto out_kill_network_unlocked;

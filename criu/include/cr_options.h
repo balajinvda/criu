@@ -204,6 +204,7 @@ struct cr_options {
 	char *lsm_profile;
 	char *lsm_mount_context;
 	unsigned int timeout;
+	unsigned int timens_budget_ms;
 	unsigned int empty_ns;
 	int tcp_skip_in_flight;
 	bool lazy_pages;
