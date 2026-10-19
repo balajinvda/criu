@@ -1,5 +1,6 @@
 #include <time.h>
 #include <sched.h>
+#include <stdbool.h>
 
 #include "types.h"
 #include "proc_parse.h"
@@ -10,26 +11,83 @@
 #include "protobuf.h"
 #include "images/timens.pb-c.h"
 
+static void normalize_timespec(struct timespec *ts);
+
+/*
+ * The clocks when the dump stopped the tasks. A restore continues the
+ * tasks' clocks from the dumped values, so the values must be read when
+ * the tasks stopped: the latest moment any of them could read a clock.
+ * Read at the end of the dump instead, they would count the dump itself
+ * (minutes for a large memory) as time the tasks ran, and a restored task
+ * would find every timeout it was waiting on expired.
+ */
+static struct {
+	bool set;
+	struct timespec mono, boot; /* in criu's own time namespace */
+	struct timespec moff, boff; /* that namespace's offsets */
+	bool offsets;
+} seized;
+
+void timens_note_seized(void)
+{
+	clock_gettime(CLOCK_MONOTONIC, &seized.mono);
+	clock_gettime(CLOCK_BOOTTIME, &seized.boot);
+	seized.offsets = parse_timens_offsets(&seized.boff, &seized.moff) == 0;
+	seized.set = true;
+}
+
+/*
+ * The clocks of the current time namespace at the moment the tasks were
+ * seized. dump_time_ns runs in criu's own time namespace for the root one
+ * and in a dumped namespace (switch_ns) for a nested one; a namespace's
+ * clocks differ from criu's by the difference of their offsets.
+ */
+static int seized_clocks(int ns_id, struct timespec *mono, struct timespec *boot)
+{
+	struct timespec moff = {}, boff = {};
+
+	if (!seized.set)
+		return -1;
+	*mono = seized.mono;
+	*boot = seized.boot;
+	if (ns_id == 0)
+		return 0;
+	if (!seized.offsets || parse_timens_offsets(&boff, &moff))
+		return -1;
+	mono->tv_sec += moff.tv_sec - seized.moff.tv_sec;
+	mono->tv_nsec += moff.tv_nsec - seized.moff.tv_nsec;
+	boot->tv_sec += boff.tv_sec - seized.boff.tv_sec;
+	boot->tv_nsec += boff.tv_nsec - seized.boff.tv_nsec;
+	normalize_timespec(mono);
+	normalize_timespec(boot);
+	return 0;
+}
+
 int dump_time_ns(int ns_id)
 {
 	struct cr_img *img;
 	TimensEntry te = TIMENS_ENTRY__INIT;
 	Timespec b = TIMESPEC__INIT, m = TIMESPEC__INIT;
-	struct timespec ts;
+	struct timespec mono, boot;
 	int ret;
 
 	img = open_image(CR_FD_TIMENS, O_DUMP, ns_id);
 	if (!img)
 		return -1;
 
-	clock_gettime(CLOCK_MONOTONIC, &ts);
+	if (seized_clocks(ns_id, &mono, &boot)) {
+		pr_warn("timens: no clocks from the seize; dumping the current ones\n");
+		clock_gettime(CLOCK_MONOTONIC, &mono);
+		clock_gettime(CLOCK_BOOTTIME, &boot);
+	}
+	pr_debug("timens: dumped monotonic %" PRId64 ".%09ld boottime %" PRId64 ".%09ld\n",
+		 (int64_t)mono.tv_sec, mono.tv_nsec, (int64_t)boot.tv_sec, boot.tv_nsec);
 	te.monotonic = &m;
-	te.monotonic->tv_sec = ts.tv_sec;
-	te.monotonic->tv_nsec = ts.tv_nsec;
-	clock_gettime(CLOCK_BOOTTIME, &ts);
+	te.monotonic->tv_sec = mono.tv_sec;
+	te.monotonic->tv_nsec = mono.tv_nsec;
 	te.boottime = &b;
-	te.boottime->tv_sec = ts.tv_sec;
-	te.boottime->tv_nsec = ts.tv_nsec;
+	te.boottime->tv_sec = boot.tv_sec;
+	te.boottime->tv_nsec = boot.tv_nsec;
 
 	ret = pb_write_one(img, &te, PB_TIMENS);
 	close_image(img);

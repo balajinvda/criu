@@ -2131,6 +2131,8 @@ int cr_dump_tasks(pid_t pid)
 
 	if (collect_pstree())
 		goto err;
+	/* The tasks are stopped: their clocks end here (timens.c). */
+	timens_note_seized();
 
 	if (checkpoint_devices())
 		goto err;
