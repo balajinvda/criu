@@ -168,26 +168,116 @@ static int trim_last_parent(char *path)
 
 #define BUFSIZE (4096)
 
-static int copy_chunk_from_file(int fd, int img, off_t off, size_t len)
-{
-	int ret;
+/*
+ * A ghost file's extents are dumped as chunks, and a restore writes the
+ * chunks into a file of the dumped size (copy_file_from_chunks), so a range
+ * left out reads back as zeros. Extents of zeros are left out too: a
+ * file mapped and pinned as a buffer (an inference engine's 600 GiB KV
+ * offload area in /dev/shm) is all allocated and mostly zeros, and was
+ * dumped and restored in full.
+ */
+#define ZERO_BLOCK (2UL << 20)
+#define ZERO_RUN_MAX (64UL << 20)
 
+static bool all_zero(const char *p, size_t len)
+{
+	const uint64_t *w = (const uint64_t *)p;
+	size_t i, n = len / sizeof(*w);
+
+	for (i = 0; i < n; i++)
+		if (w[i])
+			return false;
+	for (i = n * sizeof(*w); i < len; i++)
+		if (p[i])
+			return false;
+	return true;
+}
+
+static int write_all(int fd, const char *p, size_t len)
+{
 	while (len > 0) {
-		ret = sendfile(img, fd, &off, len);
-		if (ret <= 0) {
-			pr_perror("Can't send ghost to image");
+		ssize_t ret = write(fd, p, len);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			pr_perror("Can't write ghost chunk to image");
 			return -1;
 		}
-
+		p += ret;
 		len -= ret;
 	}
+	return 0;
+}
 
+static ssize_t pread_full(int fd, char *p, size_t len, off_t off)
+{
+	size_t done = 0;
+
+	while (done < len) {
+		ssize_t ret = pread(fd, p + done, len - done, off + done);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (ret == 0)
+			break;
+		done += ret;
+	}
+	return done;
+}
+
+/* Dump the extent [off, off + len) as chunks of its blocks that are not all zeros. */
+static int dump_chunks(int fd, struct cr_img *img, off_t off, size_t len)
+{
+	GhostChunkEntry ce = GHOST_CHUNK_ENTRY__INIT;
+	static char *buf;
+	off_t end = off + len, pos = off, run = -1;
+	size_t used = 0;
+
+	if (!buf) {
+		buf = xmalloc(ZERO_RUN_MAX);
+		if (!buf)
+			return -1;
+	}
+
+	while (pos < end || used) {
+		size_t blk = 0;
+		bool zero = true;
+
+		if (pos < end) {
+			blk = min_t(size_t, ZERO_BLOCK, end - pos);
+			if (pread_full(fd, buf + used, blk, pos) != (ssize_t)blk) {
+				pr_perror("Can't read ghost file at %lld", (long long)pos);
+				return -1;
+			}
+			zero = all_zero(buf + used, blk);
+		}
+		if (!zero) {
+			if (run < 0)
+				run = pos;
+			used += blk;
+		}
+		pos += blk;
+		/* Flush a run at a zero block, at the end, or when the buffer is full. */
+		if (used && (zero || pos >= end || used + ZERO_BLOCK > ZERO_RUN_MAX)) {
+			ce.off = run;
+			ce.len = used;
+			if (pb_write_one(img, &ce, PB_GHOST_CHUNK) || write_all(img_raw_fd(img), buf, used))
+				return -1;
+			used = 0;
+			run = -1;
+		}
+		if (pos >= end && !used)
+			break;
+	}
 	return 0;
 }
 
 static int copy_file_to_chunks(int fd, struct cr_img *img, size_t file_size)
 {
-	GhostChunkEntry ce = GHOST_CHUNK_ENTRY__INIT;
 	off_t data, hole = 0;
 
 	while (hole < file_size) {
@@ -212,13 +302,7 @@ static int copy_file_to_chunks(int fd, struct cr_img *img, size_t file_size)
 			}
 		}
 
-		ce.len = hole - data;
-		ce.off = data;
-
-		if (pb_write_one(img, &ce, PB_GHOST_CHUNK))
-			return -1;
-
-		if (copy_chunk_from_file(fd, img_raw_fd(img), ce.off, ce.len))
+		if (dump_chunks(fd, img, data, hole - data))
 			return -1;
 	}
 
@@ -239,7 +323,6 @@ static int skip_outstanding(struct fiemap_extent *fe, size_t file_size)
 
 static int copy_file_to_chunks_fiemap(int fd, struct cr_img *img, size_t file_size)
 {
-	GhostChunkEntry ce = GHOST_CHUNK_ENTRY__INIT;
 	struct fiemap *fiemap_buf;
 	struct fiemap_extent *ext_buf;
 	int ext_buf_size, fie_buf_size;
@@ -282,15 +365,8 @@ static int copy_file_to_chunks_fiemap(int fd, struct cr_img *img, size_t file_si
 			if (skip_outstanding(&fiemap_buf->fm_extents[i], file_size))
 				continue;
 
-			ce.len = fiemap_buf->fm_extents[i].fe_length;
-			ce.off = fiemap_buf->fm_extents[i].fe_logical;
-
-			if (pb_write_one(img, &ce, PB_GHOST_CHUNK)) {
-				exit_code = -1;
-				goto out;
-			}
-
-			if (copy_chunk_from_file(fd, img_raw_fd(img), ce.off, ce.len)) {
+			if (dump_chunks(fd, img, fiemap_buf->fm_extents[i].fe_logical,
+					fiemap_buf->fm_extents[i].fe_length)) {
 				exit_code = -1;
 				goto out;
 			}
