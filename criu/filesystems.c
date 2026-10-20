@@ -3,6 +3,9 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/mount.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <limits.h>
 
 #include "common/config.h"
 #include "int.h"
@@ -440,6 +443,52 @@ close_mnt_fd:
 	return ret;
 }
 
+/*
+ * tmpfs contents are archived with tar and compressed with zstd when it is
+ * on PATH, gzip otherwise. gzip runs on one core at a few hundred MB/s, so
+ * a large shared-memory buffer takes minutes to dump and to restore; zstd
+ * spreads over every core and handles its zeros at memory speed. The image
+ * keeps its name; restore tells the two apart by the frame's magic, so the
+ * images of either kind restore.
+ */
+#define TMPFS_ZSTD_DUMP "zstd -T0 -1"
+#define TMPFS_ZSTD_RESTORE "zstd -T0"
+
+static bool on_path(const char *bin)
+{
+	char *path = getenv("PATH"), *dirs, *dir, *save = NULL, file[PATH_MAX];
+	bool found = false;
+
+	if (!path)
+		return false;
+	dirs = xstrdup(path);
+	if (!dirs)
+		return false;
+	for (dir = strtok_r(dirs, ":", &save); dir && !found; dir = strtok_r(NULL, ":", &save)) {
+		snprintf(file, sizeof(file), "%s/%s", *dir ? dir : ".", bin);
+		found = access(file, X_OK) == 0;
+	}
+	xfree(dirs);
+	return found;
+}
+
+/* The compression option tar dumps a tmpfs with. */
+static const char *tmpfs_dump_compression(void)
+{
+	return on_path("zstd") ? "--use-compress-program=" TMPFS_ZSTD_DUMP : "--gzip";
+}
+
+/* The compression option tar restores the tmpfs image on fd with. */
+static const char *tmpfs_restore_compression(int fd)
+{
+	static const unsigned char zstd_magic[4] = { 0x28, 0xb5, 0x2f, 0xfd };
+	unsigned char magic[4];
+
+	if (pread(fd, magic, sizeof(magic), 0) == sizeof(magic) && !memcmp(magic, zstd_magic, sizeof(magic)))
+		return "--use-compress-program=" TMPFS_ZSTD_RESTORE;
+	return "--gzip";
+}
+
 static int tmpfs_dump(struct mount_info *pm)
 {
 	int ret = -1, fd = -1, userns_pid = -1;
@@ -481,7 +530,7 @@ static int tmpfs_dump(struct mount_info *pm)
 		userns_pid = root_item->pid->real;
 
 	ret = cr_system_userns(fd, img_raw_fd(img), -1, "tar",
-			       (char *[]){ "tar", "--create", "--gzip", "--no-unquote", "--no-wildcards",
+			       (char *[]){ "tar", "--create", (char *)tmpfs_dump_compression(), "--no-unquote", "--no-wildcards",
 					   "--one-file-system", "--check-links", "--preserve-permissions", "--sparse",
 					   "--numeric-owner", "--directory", "/proc/self/fd/0", ".", NULL },
 			       0, userns_pid);
@@ -515,7 +564,8 @@ static int tmpfs_restore(struct mount_info *pm)
 	}
 
 	ret = cr_system(img_raw_fd(img), -1, -1, "tar",
-			(char *[]){ "tar", "--extract", "--gzip", "--no-unquote", "--no-wildcards", "--directory",
+			(char *[]){ "tar", "--extract", (char *)tmpfs_restore_compression(img_raw_fd(img)), "--no-unquote",
+				    "--no-wildcards", "--directory",
 				    service_mountpoint(pm), NULL },
 			0);
 	close_image(img);
