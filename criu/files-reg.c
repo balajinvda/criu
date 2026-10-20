@@ -193,23 +193,6 @@ static bool all_zero(const char *p, size_t len)
 	return true;
 }
 
-static int write_all(int fd, const char *p, size_t len)
-{
-	while (len > 0) {
-		ssize_t ret = write(fd, p, len);
-
-		if (ret < 0) {
-			if (errno == EINTR)
-				continue;
-			pr_perror("Can't write ghost chunk to image");
-			return -1;
-		}
-		p += ret;
-		len -= ret;
-	}
-	return 0;
-}
-
 static ssize_t pread_full(int fd, char *p, size_t len, off_t off)
 {
 	size_t done = 0;
@@ -265,8 +248,12 @@ static int dump_chunks(int fd, struct cr_img *img, off_t off, size_t len)
 		if (used && (zero || pos >= end || used + ZERO_BLOCK > ZERO_RUN_MAX)) {
 			ce.off = run;
 			ce.len = used;
-			if (pb_write_one(img, &ce, PB_GHOST_CHUNK) || write_all(img_raw_fd(img), buf, used))
+			if (pb_write_one(img, &ce, PB_GHOST_CHUNK))
 				return -1;
+			if (write_all(img_raw_fd(img), buf, used) != (ssize_t)used) {
+				pr_perror("Can't write ghost chunk to image");
+				return -1;
+			}
 			used = 0;
 			run = -1;
 		}
@@ -377,8 +364,9 @@ static int copy_file_to_chunks_fiemap(int fd, struct cr_img *img, size_t file_si
 			}
 		}
 
-		/* Record file's logical offset as pos */
-		pos = ce.len + ce.off;
+		/* Continue from the end of the last extent mapped. */
+		i = fiemap_buf->fm_mapped_extents - 1;
+		pos = fiemap_buf->fm_extents[i].fe_logical + fiemap_buf->fm_extents[i].fe_length;
 
 		/* Since there are still extents left, continue. */
 	} while (fiemap_buf->fm_mapped_extents == EXTENT_MAX_COUNT);
