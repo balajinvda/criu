@@ -775,6 +775,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "plugin-option", required_argument, 0, 1105 },
 		{ "inet-addr-map", required_argument, 0, 1106 },
 		{ "timens-budget", required_argument, 0, 1107 },
+		{ "timens-no-wait", no_argument, 0, 1108 },
 		{},
 	};
 
@@ -948,6 +949,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			opts.timens_budget_ms = v;
 			break;
 		}
+		case 1108:
+			opts.timens_no_wait = true;
+			break;
 		case 1043: {
 			int fd;
 
@@ -1230,6 +1234,15 @@ int check_stream_conflicts(void)
 
 int check_options(void)
 {
+	/*
+	 * Without the wait the tasks reach their dumped clocks only after
+	 * CRIU returns: they must not run before the caller resumes them.
+	 */
+	if (opts.timens_no_wait && (!opts.timens_budget_ms || opts.final_state != TASK_STOPPED)) {
+		pr_err("--timens-no-wait requires --timens-budget and --leave-stopped\n");
+		return 1;
+	}
+
 	/*
 	 * --compress-acceleration (CLI) or compress_acceleration (RPC) on
 	 * their own imply block compression. Resolve that here rather

@@ -229,6 +229,11 @@ int timens_wait_dumped_clocks(pid_t root, int ns_id)
 
 	if (!opts.timens_budget_ms || opts.unprivileged)
 		return 0;
+	if (opts.timens_no_wait) {
+		/* --leave-stopped: the caller resumes the tasks when their clocks are there. */
+		pr_info("timens: leaving the wait for the dumped clocks to the caller\n");
+		return 0;
+	}
 
 	img = open_image(CR_FD_TIMENS, O_RSTR, ns_id);
 	if (!img)

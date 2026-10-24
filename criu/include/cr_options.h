@@ -205,6 +205,8 @@ struct cr_options {
 	char *lsm_mount_context;
 	unsigned int timeout;
 	unsigned int timens_budget_ms;
+	/* With timens_budget_ms: do not wait for the clocks; the caller resumes the tasks. */
+	bool timens_no_wait;
 	unsigned int empty_ns;
 	int tcp_skip_in_flight;
 	bool lazy_pages;
