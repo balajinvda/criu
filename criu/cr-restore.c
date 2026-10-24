@@ -1925,6 +1925,42 @@ static int catch_tasks(pid_t *pids, int nr_tasks)
 	return 0;
 }
 
+/*
+ * With --timens-no-wait every task is left stopped for the caller, which
+ * resumes them once their clocks reach the dumped values. It resumes those
+ * that ran when they were dumped, which this file lists (pids in CRIU's pid
+ * namespace, one per line), and leaves the ones that were stopped.
+ */
+#define TIMENS_RESUME_PIDS "timens-resume-pids"
+
+static int write_timens_resume_pids(void)
+{
+	struct pstree_item *item;
+	FILE *f;
+	int fd;
+
+	fd = openat(get_service_fd(IMG_FD_OFF), TIMENS_RESUME_PIDS, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		pr_perror("Unable to create %s", TIMENS_RESUME_PIDS);
+		return -1;
+	}
+	f = fdopen(fd, "w");
+	if (!f) {
+		pr_perror("Unable to open %s", TIMENS_RESUME_PIDS);
+		close(fd);
+		return -1;
+	}
+	for_each_pstree_item(item) {
+		if (task_alive(item) && item->pid->state != TASK_STOPPED)
+			fprintf(f, "%d\n", item->pid->real);
+	}
+	if (fclose(f)) {
+		pr_perror("Unable to write %s", TIMENS_RESUME_PIDS);
+		return -1;
+	}
+	return 0;
+}
+
 static void finalize_restore(void)
 {
 	struct pstree_item *item;
@@ -2311,6 +2347,10 @@ skip_ns_bouncing:
 	}
 	xfree(pids);
 	pids = NULL;
+
+	/* Without the list the caller cannot resume the tasks: fail the restore. */
+	if (opts.timens_no_wait && write_timens_resume_pids())
+		goto out_kill_network_unlocked;
 
 	finalize_restore();
 
