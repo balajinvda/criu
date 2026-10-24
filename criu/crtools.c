@@ -468,7 +468,7 @@ usage:
 	       "                        takes (up to MS) does not count as time the tasks ran\n"
 	       "  --timens-no-wait      restore, with --timens-budget and --leave-stopped: do not\n"
 	       "                        wait for the clocks; the caller resumes the tasks once\n"
-	       "                        they reach the dumped values, listed in the images\n"
+	       "                        they reach the dumped values, listed in the work\n"
 	       "                        directory's timens-resume-pids\n"
 	       "  --force-irmap         force resolving names for inotify/fsnotify watches\n"
 	       "  --irmap-scan-path FILE\n"

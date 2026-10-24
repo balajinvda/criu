@@ -1939,7 +1939,9 @@ static int write_timens_resume_pids(void)
 	FILE *f;
 	int fd;
 
-	fd = openat(get_service_fd(IMG_FD_OFF), TIMENS_RESUME_PIDS, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	/* In the work directory, beside the log and the stats: the images
+	 * directory may be read-only. */
+	fd = openat(AT_FDCWD, TIMENS_RESUME_PIDS, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
 	if (fd < 0) {
 		pr_perror("Unable to create %s", TIMENS_RESUME_PIDS);
 		return -1;
