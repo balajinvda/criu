@@ -896,6 +896,8 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 			}
 			/* Merge all vvar vma-s into one. */
 			prev_vma_area->e->end = vma_area->e->end;
+			xfree(vma_area);
+			vma_area = NULL;
 		} else {
 			if (vma_area && vma_list_add(vma_area, vma_area_list, &prev_end, &vfi, &prev_vfi))
 				goto err;
@@ -1040,7 +1042,7 @@ int prepare_loginuid(unsigned int value)
 	}
 
 	if (write(fd, buf, len) < 0) {
-		pr_warn("Write %s to /proc/self/loginuid failed: %s\n", buf, strerror(errno));
+		pr_pwarn("Write %s to /proc/self/loginuid failed", buf);
 		ret = -1;
 	}
 	close(fd);

@@ -9,6 +9,7 @@
 #include "types.h"
 
 #include "asm/compat.h"
+#include "asm/dump.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "x86: "
@@ -278,6 +279,7 @@ int arch_alloc_thread_info(CoreEntry *core)
 
 	return 0;
 err:
+	arch_free_thread_info(core);
 	return -1;
 }
 
@@ -294,6 +296,7 @@ void arch_free_thread_info(CoreEntry *core)
 		xfree(core->thread_info->fpregs->xsave->opmask_reg);
 		xfree(core->thread_info->fpregs->xsave->bndcsr_state);
 		xfree(core->thread_info->fpregs->xsave->bndreg_state);
+		xfree(core->thread_info->fpregs->xsave->cet);
 	}
 
 	xfree(core->thread_info->fpregs->st_space);

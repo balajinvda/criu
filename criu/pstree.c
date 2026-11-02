@@ -23,12 +23,33 @@
 struct pstree_item *root_item;
 static struct rb_root pid_root_rb;
 
+static void free_signal_queue(SignalQueueEntry *queue)
+{
+	size_t i;
+
+	if (!queue)
+		return;
+
+	for (i = 0; i < queue->n_signals; i++)
+		xfree(queue->signals[i]);
+	xfree(queue->signals);
+	xfree(queue);
+}
+
 void core_entry_free(CoreEntry *core)
 {
-	if (core->tc && core->tc->timers)
-		xfree(core->tc->timers->posix);
-	if (core->thread_core)
+	if (core->tc) {
+		if (core->tc->timers)
+			xfree(core->tc->timers->posix);
+		xfree(core->tc->sigactions);
+		free_signal_queue(core->tc->signals_s);
+	}
+	if (core->thread_core) {
 		xfree(core->thread_core->creds->groups);
+		xfree(core->thread_core->comm);
+		xfree(core->thread_core->rseq_entry);
+		free_signal_queue(core->thread_core->signals_p);
+	}
 	arch_free_thread_info(core);
 	xfree(core);
 }
@@ -177,6 +198,24 @@ void pstree_free_cores(struct pstree_item *item)
 	}
 }
 
+static void free_dmp_info(struct pstree_item *item)
+{
+	struct dmp_info *dinfo = dmpi(item);
+	int i;
+
+	if (dinfo->thread_lsms) {
+		for (i = 0; dinfo->thread_lsms[i]; i++) {
+			xfree(dinfo->thread_lsms[i]->profile);
+			xfree(dinfo->thread_lsms[i]->sockcreate);
+			xfree(dinfo->thread_lsms[i]);
+		}
+		xfree(dinfo->thread_lsms);
+	}
+
+	xfree(dinfo->thread_ctls);
+	xfree(dinfo->thread_sp);
+}
+
 void free_pstree(struct pstree_item *root_item)
 {
 	struct pstree_item *item = root_item, *parent;
@@ -190,6 +229,8 @@ void free_pstree(struct pstree_item *root_item)
 		parent = item->parent;
 		list_del(&item->sibling);
 		pstree_free_cores(item);
+		free_dmp_info(item);
+		xfree(item->ids);
 		xfree(item->threads);
 		xfree(item);
 		item = parent;
