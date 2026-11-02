@@ -1,0 +1,5 @@
+{   'dopts': '--external mnt[/mnt_ext_multiple_binds.test/dst_a]:MNT_A --external mnt[/mnt_ext_multiple_binds.test/dst_b]:MNT_B',
+    'feature': 'mnt_id move_mount_set_group',
+    'flavor': 'ns uns',
+    'flags': 'suid',
+    'ropts': '--external mnt[MNT_A]:/tmp/zdtm_ext_multiple_binds.tmp/bind_a --external mnt[MNT_B]:/tmp/zdtm_ext_multiple_binds.tmp/bind_b --no-mntns-compat-mode'}

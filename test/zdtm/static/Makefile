@@ -482,6 +482,7 @@ TST_DIR		=				\
 		mntns_pivot_root_ro		\
 		mnt_ext_sharing			\
 		mnt_ext_multiple		\
+		mnt_ext_multiple_binds		\
 		mount_complex_sharing		\
 		mnt_tracefs			\
 		mntns_deleted			\

@@ -956,15 +956,29 @@ static int restore_one_sharing(struct sharing_group *sg, struct mount_info *targ
 				goto err;
 			}
 		} else {
+			struct mount_info *ext;
+			char *source = sg->source;
+
 			/*
 			 * External slavery. We rely on the user to give us the
 			 * right source for external mount with all proper
 			 * sharing options setup (it should be either shared
 			 * or non-shared slave). If source is a private mount
 			 * we would fail.
+			 *
+			 * Mounts of one sharing group can be binds of different
+			 * external mounts (a container runtime's per-file binds
+			 * of one host directory, each given as its own external
+			 * mountpoint on restore). The kernel copies sharing only
+			 * from a mount whose root contains the target's, so take
+			 * the target's own external source when it has one.
 			 */
-			if (move_mount_set_group(-1, sg->source, target->mnt_fd_id)) {
-				pr_err("Failed to copy sharing from source %s to %d\n", sg->source, target->mnt_id);
+			ext = mnt_get_external_bind_nodev(target);
+			if (ext)
+				source = ext->external;
+
+			if (move_mount_set_group(-1, source, target->mnt_fd_id)) {
+				pr_err("Failed to copy sharing from source %s to %d\n", source, target->mnt_id);
 				goto err;
 			}
 		}
